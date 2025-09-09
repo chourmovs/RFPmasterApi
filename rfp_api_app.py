@@ -1,34 +1,33 @@
 # rfp_api_app.py
 # -*- coding: utf-8 -*-
 """
-API FastAPI pour RFP Parser & Exports — version optimisée (streaming JSON-first)
--------------------------------------------------------------------------------
+API FastAPI pour RFP Parser & Exports — streaming + JSON-first + auto-repair en cas de troncature
+-------------------------------------------------------------------------------------------------
 
 Ce que fait ce fichier
 - Endpoints:
   - GET  /health
-  - POST /submit                -> crée un job (avec déduplication via hash du texte)
-  - GET  /status?job_id=...     -> état + urls + json_preview (mis à jour en streaming)
+  - POST /submit                -> crée un job (déduplication sur hash du texte)
+  - GET  /status?job_id=...     -> état + urls + json_preview (stream live)
   - GET  /results/{job_id}/raw.json | own.csv | feuille_de_charge.xlsx
 - Pipeline:
   - Appelle DeepInfra en **streaming** (OpenAI-compatible) → met à jour `json_preview`
+  - Tente un parse strict; si échec, **répare** en tronquant au **dernier JSON équilibré** (anti-troncature)
   - Persist **raw.json** dès que complet (JSON-first)
   - (optionnel) own.csv (hook prêt)
   - Génère **feuille_de_charge.xlsx** en fin de job
 
-Fonctions proposées
-- new_job(text_hash, text), set_job_status(...)
-- build_payload(text), call_deepinfra_stream(payload, on_chunk), parse_streaming(text, on_preview)
-- persist_doc(...), build_csv_if_available(...), build_xlsx(...)
-- run_job(job_id, text, text_hash)
-
-Notes
-- Requiert `rfp_parser/` accessible (ton entrypoint Space clone RFPmaster et met PYTHONPATH)
+Variables d'env utiles (HF Space → Settings → Variables & secrets)
+- DEEPINFRA_API_KEY           (obligatoire)
+- RFP_MODEL                   (def: meta-llama/Meta-Llama-3.1-8B-Instruct)
+- RFP_MAX_TOKENS              (def: 600)  ← augmente à 800/900 si tu as souvent de longs JSON
+- RFP_TEMPERATURE             (def: 0.1)
+- RFP_DEBUG                   (1/0)
 """
 
 from __future__ import annotations
 from typing import Dict, Any, Tuple, Optional, Callable
-import os, json, uuid, threading, time, traceback, hashlib
+import os, json, uuid, threading, time, traceback
 from pathlib import Path
 import logging
 import requests
@@ -38,7 +37,7 @@ from fastapi.responses import JSONResponse, FileResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
 
-# === Imports depuis ton repo (RFPmaster) ===
+# === Imports depuis ta lib (clonée par l'entrypoint via RFPmaster) ===
 from rfp_parser.prompting import build_chat_payload
 from rfp_parser.exports_xls import build_xls_from_doc
 # from rfp_parser.exports_csv import build_csv_from_doc   # (optionnel)
@@ -102,15 +101,12 @@ _session.mount("https://", _adapter)
 _session.headers.update({"Connection": "keep-alive"})
 
 def build_payload(text: str) -> Dict[str, Any]:
-    """
-    Construit un payload court pour accélérer l’inférence et forcer un JSON compact.
-    On s’appuie sur ton prompting interne (messages), et on force des paramètres.
-    """
     base = build_chat_payload(text, model=MODEL_NAME)
     base["temperature"] = RFP_TEMPERATURE
     base["max_tokens"] = RFP_MAX_TOKENS
     base["stream"] = True
-    base["response_format"] = {"type": "json_object"}  # accepté par DeepInfra OpenAI-compat
+    # DeepInfra (OpenAI-compat) accepte normalement response_format json_object
+    base["response_format"] = {"type": "json_object"}
     return base
 
 def _iter_deepinfra_stream(payload: Dict[str, Any]):
@@ -140,6 +136,73 @@ def call_deepinfra_stream(payload: Dict[str, Any], on_chunk: Callable[[str], Non
             on_chunk(delta)
     return "".join(buf)
 
+# --------- JSON Repair helpers ---------
+def _truncate_to_last_balanced_json(s: str) -> Optional[str]:
+    """
+    Parcourt le texte et retourne la **plus longue sous-chaîne initiale** dont
+    les accolades/crochets sont **équilibrés** en dehors des chaînes.
+    Utile quand le modèle est tronqué en plein milieu d'un objet.
+    """
+    stack = []
+    in_str = False
+    esc = False
+    last_ok = None
+    for i, ch in enumerate(s):
+        if in_str:
+            if esc:
+                esc = False
+            elif ch == '\\':
+                esc = True
+            elif ch == '"':
+                in_str = False
+        else:
+            if ch == '"':
+                in_str = True
+            elif ch in '{[':
+                stack.append(ch)
+            elif ch in '}]':
+                if not stack:
+                    # plus de fermetures que d'ouvertures → JSON corrompu
+                    return None
+                op = stack.pop()
+                if (op == '{' and ch != '}') or (op == '[' and ch != ']'):
+                    return None
+                if not stack:
+                    # un objet/array top-level est complet ici
+                    last_ok = i + 1
+            else:
+                pass
+    if last_ok is not None:
+        return s[:last_ok]
+    return None
+
+def _parse_with_repair(full_txt: str) -> Dict[str, Any]:
+    """
+    Essaie d’abord un parse strict; si échec, tente une **troncature sûre**
+    au dernier JSON équilibré (permet d’éviter les plantages pour une fin coupée).
+    """
+    txt = (full_txt or "").strip().strip("`")
+    # 1) parse strict
+    try:
+        return json.loads(txt)
+    except Exception as e1:
+        # 2) strip extra + retry
+        try:
+            return json.loads(txt.strip())
+        except Exception as e2:
+            # 3) tentative de troncature équilibrée
+            repaired = _truncate_to_last_balanced_json(txt)
+            if repaired:
+                try:
+                    logger.warning("[REPAIR] JSON tronqué détecté → troncature sûre appliquée (len=%d -> %d)",
+                                   len(txt), len(repaired))
+                    return json.loads(repaired)
+                except Exception as e3:
+                    pass
+            # 4) impossible de réparer proprement
+            raise RuntimeError(f"JSON invalide renvoyé par le modèle: {e2}\n---\n{txt[:4000]}")
+
+# --------- Parsing streaming (avec preview) ---------
 def parse_streaming(text: str, on_preview: Callable[[str], None]) -> Dict[str, Any]:
     if not DEEPINFRA_API_KEY:
         raise RuntimeError("DEEPINFRA_API_KEY manquant.")
@@ -148,17 +211,9 @@ def parse_streaming(text: str, on_preview: Callable[[str], None]) -> Dict[str, A
     def _on_chunk(d: str):
         acc.append(d)
         on_preview(("".join(acc))[:1500])  # preview tronquée
-    full_txt = call_deepinfra_stream(payload, _on_chunk).strip().strip("`")
-    try:
-        doc = json.loads(full_txt)
-    except Exception as e:
-        try:
-            doc = json.loads(full_txt.strip().strip("`").strip())
-        except Exception as e2:
-            raise RuntimeError(f"JSON invalide renvoyé par le modèle: {e2}\n---\n{full_txt[:4000]}")
-    if not isinstance(doc, dict):
-        raise RuntimeError("Le contenu renvoyé n'est pas un objet JSON.")
-    return doc
+    full_txt = call_deepinfra_stream(payload, _on_chunk)
+    # Parse strict + auto-repair en cas de troncature
+    return _parse_with_repair(full_txt)
 
 # --------- Persistences ---------
 def persist_doc(job_dir: Path, doc: Dict[str, Any]) -> Tuple[str, str]:
@@ -171,6 +226,7 @@ def persist_doc(job_dir: Path, doc: Dict[str, Any]) -> Tuple[str, str]:
 
 def build_csv_if_available(doc: Dict[str, Any], job_dir: Path) -> Tuple[Optional[str], Optional[str]]:
     try:
+        # Exemple si tu actives l'export CSV :
         # out_path = job_dir / "own.csv"
         # build_csv_from_doc(doc, str(out_path))
         # return str(out_path), f"/results/{job_dir.name}/own.csv"
@@ -229,7 +285,7 @@ def run_job(job_id: str, text: str, text_hash: str) -> None:
         set_job_status(job_id, status="error", error=str(e), done_at=time.time())
 
 # --------- FastAPI app ---------
-app = FastAPI(title="RFP_MASTER API", version="1.2.0")
+app = FastAPI(title="RFP_MASTER API", version="1.3.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
