@@ -1,69 +1,56 @@
 # rfp_api_app.py
 # -*- coding: utf-8 -*-
 """
-API FastAPI pour RFP Parser & Exports (DeepInfra en backend)
-===========================================================
+API FastAPI pour RFP Parser & Exports — version optimisée (streaming JSON-first)
+-------------------------------------------------------------------------------
 
 Ce que fait ce fichier
-----------------------
-- Expose 4 endpoints principaux :
-  - GET  /health : ping + modèle utilisé.
-  - POST /submit : lance un job asynchrone {text} -> job_id.
-  - GET  /status : renvoie l'état du job, liens de résultats (raw.json, own.csv, xlsx),
-                  et un aperçu court du JSON pour “live JSON”.
-  - GET  /results/{job_id}/... : sert les artefacts (raw.json, own.csv, feuille_de_charge.xlsx).
+- Endpoints:
+  - GET  /health
+  - POST /submit                -> crée un job (avec déduplication via hash du texte)
+  - GET  /status?job_id=...     -> état + urls + json_preview (mis à jour en streaming)
+  - GET  /results/{job_id}/raw.json | own.csv | feuille_de_charge.xlsx
+- Pipeline:
+  - Appelle DeepInfra en **streaming** (OpenAI-compatible) → met à jour `json_preview`
+  - Persist **raw.json** dès que complet (JSON-first)
+  - (optionnel) own.csv (hook prêt)
+  - Génère **feuille_de_charge.xlsx** en fin de job
 
-Ce que propose chaque fonction
-------------------------------
-- new_job(text: str) -> str :
-    Crée un job en mémoire, status "queued", retourne job_id.
-- set_job_status(job_id: str, **updates) -> None :
-    Met à jour les métadonnées d'un job (thread-safe).
-- parse_with_deepinfra(text: str) -> dict :
-    Construit le payload LLM (via rfp_parser.prompting.build_chat_payload),
-    appelle DeepInfra et parse le JSON renvoyé (strippé si fenced).
-- persist_doc(job_dir: Path, doc: dict) -> tuple[str, str] :
-    Sauvegarde doc dans raw.json (UTF-8), retourne (path, url).
-- build_csv_if_available(doc: dict, job_dir: Path) -> tuple[str|None, str|None] :
-    (Optionnel) si ton repo expose un export CSV, le génère; sinon None.
-- build_xlsx(doc: dict, job_dir: Path) -> str :
-    Construit la feuille Excel dynamique (via rfp_parser.exports_xls.build_xls_from_doc).
-- run_job(job_id: str, text: str) -> None :
-    Orchestration : parse -> persist raw.json -> (own.csv si dispo) -> xlsx -> maj status.
-
-Logs
-----
-- Logger [API] avec niveau INFO (ou DEBUG si RFP_DEBUG=1).
-- Traces détaillées sur DeepInfra / persistences / erreurs.
+Fonctions proposées
+- new_job(text_hash, text), set_job_status(...)
+- build_payload(text), call_deepinfra_stream(payload, on_chunk), parse_streaming(text, on_preview)
+- persist_doc(...), build_csv_if_available(...), build_xlsx(...)
+- run_job(job_id, text, text_hash)
 
 Notes
------
-- Jobs en mémoire : si le process redémarre, l'état est perdu (simple mais suffisant en Space).
-- CORS permissif (*): autorise les requêtes depuis le Space Gradio.
+- Requiert `rfp_parser/` accessible (ton entrypoint Space clone RFPmaster et met PYTHONPATH)
 """
 
 from __future__ import annotations
-from typing import Dict, Any, Tuple, Optional
-import os, json, uuid, threading, time, traceback
+from typing import Dict, Any, Tuple, Optional, Callable
+import os, json, uuid, threading, time, traceback, hashlib
 from pathlib import Path
 import logging
 import requests
 
-from fastapi import FastAPI, HTTPException, Query
-from fastapi.responses import JSONResponse, FileResponse
+from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi.responses import JSONResponse, FileResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.gzip import GZipMiddleware
 
-# === Imports depuis ton repo RFPmaster ===
+# === Imports depuis ton repo (RFPmaster) ===
 from rfp_parser.prompting import build_chat_payload
 from rfp_parser.exports_xls import build_xls_from_doc
-# Si tu as un export CSV (ex: rfp_parser.exports_csv), décommente et branche ici :
-# from rfp_parser.exports_csv import build_csv_from_doc
+# from rfp_parser.exports_csv import build_csv_from_doc   # (optionnel)
 
 # --------- Config ---------
 DEEPINFRA_API_KEY = os.environ.get("DEEPINFRA_API_KEY", "")
-MODEL_NAME        = os.environ.get("RFP_MODEL", "meta-llama/Meta-Llama-3.1-70B-Instruct")
+MODEL_NAME        = os.environ.get("RFP_MODEL", "meta-llama/Meta-Llama-3.1-8B-Instruct")
 DEEPINFRA_URL     = os.environ.get("DEEPINFRA_URL", "https://api.deepinfra.com/v1/openai/chat/completions")
 RFP_DEBUG         = str(os.environ.get("RFP_DEBUG", "0")).lower() in {"1", "true", "yes"}
+RFP_MAX_TOKENS    = int(os.environ.get("RFP_MAX_TOKENS", "600"))
+RFP_TEMPERATURE   = float(os.environ.get("RFP_TEMPERATURE", "0.1"))
+
 BASE_TMP          = Path("/tmp/rfp_jobs"); BASE_TMP.mkdir(parents=True, exist_ok=True)
 
 logger = logging.getLogger("RFP_API")
@@ -76,8 +63,13 @@ logger.setLevel(logging.DEBUG if RFP_DEBUG else logging.INFO)
 # --------- Jobs en mémoire ---------
 JOBS: Dict[str, Dict[str, Any]] = {}
 JOBS_LOCK = threading.Lock()
+TEXT2JOB: Dict[str, str] = {}  # hash(text) -> job_id (cache dédup)
 
-def new_job(text: str) -> str:
+def _hash_text(text: str) -> str:
+    import hashlib
+    return hashlib.sha1((text or "").encode("utf-8")).hexdigest()
+
+def new_job(text_hash: str, text: str) -> str:
     job_id = uuid.uuid4().hex[:12]
     with JOBS_LOCK:
         JOBS[job_id] = {
@@ -91,9 +83,10 @@ def new_job(text: str) -> str:
             "xlsx_url": None,
             "started_at": time.time(),
             "done_at": None,
-            "meta": {"model": MODEL_NAME, "length": len(text or "")},
-            "json_preview": None,  # court extrait pour le “live JSON”
+            "meta": {"model": MODEL_NAME, "length": len(text or ""), "hash": text_hash},
+            "json_preview": None,
         }
+        TEXT2JOB[text_hash] = job_id
     return job_id
 
 def set_job_status(job_id: str, **updates):
@@ -101,30 +94,73 @@ def set_job_status(job_id: str, **updates):
         if job_id in JOBS:
             JOBS[job_id].update(**updates)
 
-# --------- Cœur pipeline ---------
-def parse_with_deepinfra(text: str) -> Dict[str, Any]:
-    if not DEEPINFRA_API_KEY:
-        raise RuntimeError("DEEPINFRA_API_KEY manquant (Settings → Secrets du Space).")
-    payload = build_chat_payload(text, model=MODEL_NAME)
+# --------- LLM (DeepInfra) ---------
+_session = requests.Session()
+_adapter = requests.adapters.HTTPAdapter(pool_connections=8, pool_maxsize=16, max_retries=0)
+_session.mount("http://", _adapter)
+_session.mount("https://", _adapter)
+_session.headers.update({"Connection": "keep-alive"})
+
+def build_payload(text: str) -> Dict[str, Any]:
+    """
+    Construit un payload court pour accélérer l’inférence et forcer un JSON compact.
+    On s’appuie sur ton prompting interne (messages), et on force des paramètres.
+    """
+    base = build_chat_payload(text, model=MODEL_NAME)
+    base["temperature"] = RFP_TEMPERATURE
+    base["max_tokens"] = RFP_MAX_TOKENS
+    base["stream"] = True
+    base["response_format"] = {"type": "json_object"}  # accepté par DeepInfra OpenAI-compat
+    return base
+
+def _iter_deepinfra_stream(payload: Dict[str, Any]):
     headers = {"Authorization": f"Bearer {DEEPINFRA_API_KEY}", "Content-Type": "application/json"}
-    logger.info("DeepInfra call model=%s max_tokens=%s", payload.get("model"), payload.get("max_tokens"))
-    r = requests.post(DEEPINFRA_URL, headers=headers, json=payload, timeout=120)
-    if r.status_code // 100 != 2:
-        raise RuntimeError(f"DeepInfra HTTP {r.status_code}: {r.text}")
-    data = r.json()
+    with _session.post(DEEPINFRA_URL, headers=headers, json=payload, timeout=180, stream=True) as r:
+        if r.status_code // 100 != 2:
+            raise RuntimeError(f"DeepInfra HTTP {r.status_code}: {r.text}")
+        for line in r.iter_lines(decode_unicode=True):
+            if not line:
+                continue
+            if line.startswith("data:"):
+                data = line[len("data:"):].strip()
+                if data == "[DONE]":
+                    break
+                yield data
+
+def call_deepinfra_stream(payload: Dict[str, Any], on_chunk: Callable[[str], None]) -> str:
+    buf = []
+    for data in _iter_deepinfra_stream(payload):
+        try:
+            obj = json.loads(data)
+            delta = obj["choices"][0]["delta"].get("content") or ""
+        except Exception:
+            delta = ""
+        if delta:
+            buf.append(delta)
+            on_chunk(delta)
+    return "".join(buf)
+
+def parse_streaming(text: str, on_preview: Callable[[str], None]) -> Dict[str, Any]:
+    if not DEEPINFRA_API_KEY:
+        raise RuntimeError("DEEPINFRA_API_KEY manquant.")
+    payload = build_payload(text)
+    acc = []
+    def _on_chunk(d: str):
+        acc.append(d)
+        on_preview(("".join(acc))[:1500])  # preview tronquée
+    full_txt = call_deepinfra_stream(payload, _on_chunk).strip().strip("`")
     try:
-        content = data["choices"][0]["message"]["content"]
-    except Exception:
-        raise RuntimeError(f"Réponse inattendue DeepInfra: {json.dumps(data)[:400]}")
-    try:
-        doc = json.loads(content)
+        doc = json.loads(full_txt)
     except Exception as e:
-        logger.warning("json.loads(content) a échoué; strip fallback. Err=%s", e)
-        doc = json.loads(content.strip().strip('`').strip())
+        try:
+            doc = json.loads(full_txt.strip().strip("`").strip())
+        except Exception as e2:
+            raise RuntimeError(f"JSON invalide renvoyé par le modèle: {e2}\n---\n{full_txt[:4000]}")
     if not isinstance(doc, dict):
         raise RuntimeError("Le contenu renvoyé n'est pas un objet JSON.")
     return doc
 
+# --------- Persistences ---------
 def persist_doc(job_dir: Path, doc: Dict[str, Any]) -> Tuple[str, str]:
     job_dir.mkdir(parents=True, exist_ok=True)
     raw_path = job_dir / "raw.json"
@@ -134,12 +170,7 @@ def persist_doc(job_dir: Path, doc: Dict[str, Any]) -> Tuple[str, str]:
     return str(raw_path), raw_url
 
 def build_csv_if_available(doc: Dict[str, Any], job_dir: Path) -> Tuple[Optional[str], Optional[str]]:
-    """
-    Si tu as un export CSV dans ton repo, branche-le ici.
-    Sinon, on renvoie (None, None) sans erreur pour rester permissif.
-    """
     try:
-        # Exemple si tu as build_csv_from_doc(doc, out_path)
         # out_path = job_dir / "own.csv"
         # build_csv_from_doc(doc, str(out_path))
         # return str(out_path), f"/results/{job_dir.name}/own.csv"
@@ -159,63 +190,72 @@ def build_xlsx(doc: Dict[str, Any], job_dir: Path) -> str:
     build_xls_from_doc(doc, out_path, baseline_kg=baseline)
     return out_path
 
-def run_job(job_id: str, text: str) -> None:
+# --------- Orchestrateur ---------
+def run_job(job_id: str, text: str, text_hash: str) -> None:
     set_job_status(job_id, status="running")
     job_dir = BASE_TMP / job_id
+    t0 = time.time()
     try:
-        # 1) Parse LLM
-        doc = parse_with_deepinfra(text)
+        # 1) LLM streaming → preview live
+        def _push_preview(pre):
+            set_job_status(job_id, json_preview=pre)
+        doc = parse_streaming(text, on_preview=_push_preview)
 
-        # 2) Persist raw.json immédiatement (pour JSON-first côté client)
+        # 2) raw.json immédiatement
         raw_path, raw_url = persist_doc(job_dir, doc)
-        preview = json.dumps(doc, ensure_ascii=False)[:1500]  # court extrait
-        set_job_status(job_id, raw_json_path=raw_path, raw_json_url=raw_url, json_preview=preview)
+        set_job_status(job_id, raw_json_path=raw_path, raw_json_url=raw_url)
 
-        # 3) (Optionnel) Génère own.csv si dispo
+        # 3) own.csv (optionnel)
         csv_path, csv_url = build_csv_if_available(doc, job_dir)
         if csv_path and csv_url:
             set_job_status(job_id, own_csv_path=csv_path, own_csv_url=csv_url)
 
-        # 4) XLSX (peut être le plus long)
+        # 4) XLSX
         xlsx_path = build_xlsx(doc, job_dir)
         xlsx_url = f"/results/{job_id}/feuille_de_charge.xlsx"
 
-        # 5) Terminé
+        # 5) fin
         set_job_status(
             job_id,
             status="done",
             xlsx_path=xlsx_path,
             xlsx_url=xlsx_url,
             done_at=time.time(),
-            meta={**JOBS[job_id]["meta"], "assumptions": doc.get("assumptions")},
+            meta={**JOBS[job_id]["meta"], "assumptions": doc.get("assumptions"), "elapsed_s": round(time.time()-t0, 3)},
         )
-        logger.info("Job %s terminé -> %s", job_id, xlsx_path)
+        logger.info("Job %s terminé en %.3fs -> %s", job_id, time.time()-t0, xlsx_path)
     except Exception as e:
         logger.error("Job %s échoué: %s\n%s", job_id, e, traceback.format_exc())
         set_job_status(job_id, status="error", error=str(e), done_at=time.time())
 
-# --------- FastAPI ---------
-app = FastAPI(title="RFP_MASTER API", version="1.1.0")
+# --------- FastAPI app ---------
+app = FastAPI(title="RFP_MASTER API", version="1.2.0")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],   # restreins ici si tu veux limiter au Space Gradio
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+app.add_middleware(GZipMiddleware, minimum_size=512)
 
 @app.get("/health")
 def health():
-    return {"ok": True, "ts": time.time(), "model": MODEL_NAME}
+    return {"ok": True, "ts": time.time(), "model": MODEL_NAME, "max_tokens": RFP_MAX_TOKENS, "temperature": RFP_TEMPERATURE}
 
 @app.post("/submit")
 def submit(payload: Dict[str, Any]):
     text = (payload or {}).get("text", "")
     if not isinstance(text, str) or not text.strip():
         raise HTTPException(400, "Champ 'text' manquant ou vide.")
-    job_id = new_job(text)
-    logger.info("Submit reçu job_id=%s len(text)=%d", job_id, len(text))
-    t = threading.Thread(target=run_job, args=(job_id, text), daemon=True)
+    text_hash = _hash_text(text)
+    with JOBS_LOCK:
+        existing = TEXT2JOB.get(text_hash)
+    if existing:
+        return JSONResponse({"job_id": existing, "status": JOBS.get(existing, {}).get("status", "unknown"), "dedup": True})
+    job_id = new_job(text_hash, text)
+    logger.info("Submit job_id=%s len(text)=%d hash=%s", job_id, len(text), text_hash[:8])
+    t = threading.Thread(target=run_job, args=(job_id, text, text_hash), daemon=True)
     t.start()
     return JSONResponse({"job_id": job_id, "status": "queued"})
 
@@ -225,7 +265,6 @@ def status(job_id: str = Query(..., description="Identifiant renvoyé par /submi
         info = JOBS.get(job_id)
     if not info:
         raise HTTPException(404, f"job_id inconnu: {job_id}")
-    # On expose les URLs disponibles + un petit aperçu JSON (pour “live JSON”)
     return JSONResponse({
         "job_id": job_id,
         "status": info.get("status"),
@@ -237,7 +276,6 @@ def status(job_id: str = Query(..., description="Identifiant renvoyé par /submi
         "json_preview": info.get("json_preview"),
     })
 
-# ---- Résultats ----
 @app.get("/results/{job_id}/raw.json")
 def download_raw(job_id: str):
     with JOBS_LOCK:
