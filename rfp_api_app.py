@@ -44,10 +44,10 @@ from rfp_parser.exports_xls import build_xls_from_doc
 
 # --------- Config ---------
 DEEPINFRA_API_KEY = os.environ.get("DEEPINFRA_API_KEY", "")
-MODEL_NAME        = os.environ.get("RFP_MODEL", "meta-llama/Meta-Llama-3.1-8B-Instruct")
+MODEL_NAME        = os.environ.get("RFP_MODEL", "NousResearch/Hermes-3-Llama-3.1-70B")
 DEEPINFRA_URL     = os.environ.get("DEEPINFRA_URL", "https://api.deepinfra.com/v1/openai/chat/completions")
 RFP_DEBUG         = str(os.environ.get("RFP_DEBUG", "0")).lower() in {"1", "true", "yes"}
-RFP_MAX_TOKENS    = int(os.environ.get("RFP_MAX_TOKENS", "600"))
+RFP_MAX_TOKENS    = int(os.environ.get("RFP_MAX_TOKENS", "6000"))
 RFP_TEMPERATURE   = float(os.environ.get("RFP_TEMPERATURE", "0.1"))
 
 BASE_TMP          = Path("/tmp/rfp_jobs"); BASE_TMP.mkdir(parents=True, exist_ok=True)
