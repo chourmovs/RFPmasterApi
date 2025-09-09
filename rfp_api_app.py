@@ -4,29 +4,25 @@
 API FastAPI pour RFP Parser & Exports — streaming DeepInfra + EXPORT UNIFIÉ
 ===========================================================================
 
-Ce que fait ce fichier
-----------------------
-- Endpoints:
-  - GET  /health
-  - POST /submit                -> crée un job (dédup sur hash du texte)
-  - GET  /status?job_id=...     -> état + urls + json_preview (stream live)
-  - GET  /results/{job_id}/raw.json | own.csv | feuille_de_charge.xlsx
+Version modifiée : pretty JSON preview
+-------------------------------------
+Modifs principales :
+- Ajout d'un pretty-printer progressif pour la preview stockée dans JOBS[job_id]['json_preview'].
+  - On tente une réparation/parse via _attempt_repair_json(buffer) et on pretty-print si possible.
+  - Sinon, fallback soft pretty pour améliorer la lisibilité (retours-lignes après '},', '],', '}{', ...).
+- Preview tronquée (MAX_PREVIEW_CHARS) pour éviter d'envoyer trop de données au front.
+- Contrôlé par l'env var PRETTY_JSON_STREAM (si True on tente le pretty, sinon on garde le comportement simple).
+- Logs [PREVIEW] ajoutés pour debug.
 
-- Pipeline:
-  1) Appelle DeepInfra en **streaming** (OpenAI-compatible) → met à jour `json_preview`
-  2) Parse strict puis **répare** si JSON tronqué (trim + fermetures auto)
-  3) **export_outputs(doc, job_dir)** : écrit *raw.json*, *own.csv*, *xlsx* (formules)
-  4) Met à jour les URLs et termine le job
+Rappel endpoints exposés :
+- GET  /health
+- POST /submit
+- GET  /status?job_id=...
+- GET  /results/{job_id}/raw.json | own.csv | feuille_de_charge.xlsx
 
-Fonctions exposées (interne API)
---------------------------------
-- submit(payload) -> {job_id, status}
-- status(job_id)  -> état + urls
-- download endpoints pour raw.json / own.csv / xlsx
-
-Logs
-----
-- Préfixes: [API], [REPAIR]
+Important :
+- Ce fichier remplace entièrement l'ancien rfp_api_app.py (copie complète incluse).
+- Après déploiement, définis PRETTY_JSON_STREAM=1 et relance l'app (si tu veux forcer l'affichage pretty).
 """
 
 from __future__ import annotations
@@ -52,6 +48,10 @@ DEEPINFRA_URL     = os.environ.get("DEEPINFRA_URL", "https://api.deepinfra.com/v
 RFP_DEBUG         = str(os.environ.get("RFP_DEBUG", "0")).lower() in {"1","true","yes"}
 RFP_MAX_TOKENS    = int(os.environ.get("RFP_MAX_TOKENS", "8000"))
 RFP_TEMPERATURE   = float(os.environ.get("RFP_TEMPERATURE", "0.1"))
+
+# Control preview pretty behavior (env)
+PRETTY_JSON_STREAM = str(os.environ.get("PRETTY_JSON_STREAM", "1")).lower() in {"1","true","yes"}
+MAX_PREVIEW_CHARS = int(os.environ.get("MAX_PREVIEW_CHARS", "1500"))
 
 BASE_TMP          = Path("/tmp/rfp_jobs"); BASE_TMP.mkdir(parents=True, exist_ok=True)
 
@@ -126,19 +126,32 @@ def _iter_deepinfra_stream(payload: Dict[str, Any]):
                 yield data
 
 def call_deepinfra_stream(payload: Dict[str, Any], on_chunk: Callable[[str], None]) -> str:
+    """
+    Appelle DeepInfra en streaming et envoie chaque delta via on_chunk.
+    Retourne la concaténation complète (string) — inchangé pour compatibilité existante.
+    """
     buf = []
     for data in _iter_deepinfra_stream(payload):
         try:
             obj = json.loads(data)
             delta = obj["choices"][0]["delta"].get("content") or ""
         except Exception:
+            # Si le chunk n'est pas JSON (rare), on l'envoie tel quel
             delta = ""
+            try:
+                # tentative : si data lui-même est un string utile
+                delta = data
+            except Exception:
+                delta = ""
         if delta:
             buf.append(delta)
-            on_chunk(delta)
+            try:
+                on_chunk(delta)
+            except Exception:
+                logger.exception("[API] erreur dans on_chunk callback")
     return "".join(buf)
 
-# --------- JSON Repair robuste ---------
+# --------- JSON Repair robuste (repris tel quel) ---------
 _WS_COMMA_TAIL = re.compile(r"[ \t\r\n,]+$")
 
 def _scan_stack(s: str):
@@ -207,16 +220,84 @@ def _parse_with_repair(full_txt: str) -> Dict[str, Any]:
             return fixed
         raise RuntimeError(f"JSON invalide renvoyé par le modèle: {e1}\n---\n{txt[:4000]}")
 
+# --------- Helpers preview pretty ----------
+def _soft_pretty_fragment(s: str, max_chars: int = MAX_PREVIEW_CHARS) -> str:
+    """
+    Heuristique simple pour rendre lisible un fragment JSON incomplet :
+    - insère retours-ligne après '},' '],', et entre '}{'
+    - tronque proprement
+    """
+    if not s:
+        return ""
+    # remplacements simples pour lisibilité
+    out = s.replace("}{", "}\n{")
+    out = out.replace("],", "],\n")
+    out = out.replace("},", "},\n")
+    # enlever espaces multiples pour preview compacte
+    out = re.sub(r"\s{2,}", " ", out)
+    # tronquer en fin de chaine (garder le début)
+    if len(out) > max_chars:
+        return out[:max_chars] + "\n... (truncated)"
+    return out
+
+def _format_preview(buffer_text: str, max_chars: int = MAX_PREVIEW_CHARS) -> str:
+    """
+    Tente :
+    1) json.loads(buffer_text) -> pretty
+    2) _attempt_repair_json(buffer_text) -> pretty
+    3) fallback : _soft_pretty_fragment
+    Toujours renvoie une string (<= max_chars + suffix)
+    """
+    if not buffer_text:
+        return ""
+    try:
+        parsed = json.loads(buffer_text)
+        return json.dumps(parsed, indent=2, ensure_ascii=False)[: max_chars]
+    except Exception:
+        pass
+    # try repair (may close stacks)
+    try:
+        fixed = _attempt_repair_json(buffer_text, max_trim=5000)
+        if fixed is not None:
+            return json.dumps(fixed, indent=2, ensure_ascii=False)[: max_chars]
+    except Exception:
+        pass
+    # fallback soft pretty
+    return _soft_pretty_fragment(buffer_text, max_chars=max_chars)
+
 # --------- Parsing streaming (avec preview) ---------
 def parse_streaming(text: str, on_preview: Callable[[str], None]) -> Dict[str, Any]:
+    """
+    Envoie la requête en streaming à DeepInfra, construit la preview
+    et retourne le JSON final parsé (avec tentative de réparation si nécessaire).
+    """
     if not DEEPINFRA_API_KEY:
         raise RuntimeError("DEEPINFRA_API_KEY manquant.")
     payload = build_payload(text)
     acc = []
+    # local buffer string for preview composition
+    buffer_text = ""
+
     def _on_chunk(d: str):
+        nonlocal buffer_text
+        # d est le delta (string) envoyé par DeepInfra (peut être fragmentaire)
         acc.append(d)
-        on_preview(("".join(acc))[:1500])  # preview tronquée
+        buffer_text = "".join(acc)
+        # choisir si on pretty-print ou non selon l'env
+        if PRETTY_JSON_STREAM:
+            pretty = _format_preview(buffer_text, max_chars=MAX_PREVIEW_CHARS)
+        else:
+            # comportement minimal : preview = début brut
+            pretty = buffer_text[:MAX_PREVIEW_CHARS]
+        # log preview size for debug (truncated)
+        logger.debug("[PREVIEW] len=%d", len(pretty))
+        try:
+            on_preview(pretty)
+        except Exception:
+            logger.exception("[API] erreur lors de l'appel on_preview")
+
     full_txt = call_deepinfra_stream(payload, _on_chunk)
+    # full_txt est la concaténation complète des deltas envoyés par call_deepinfra_stream
     return _parse_with_repair(full_txt)
 
 # --------- Orchestrateur ---------
