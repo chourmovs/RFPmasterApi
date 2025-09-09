@@ -1,53 +1,56 @@
 # rfp_api_app.py
 # -*- coding: utf-8 -*-
 """
-API FastAPI pour RFP Parser & Exports — streaming + JSON-first + auto-repair en cas de troncature
--------------------------------------------------------------------------------------------------
+API FastAPI pour RFP Parser & Exports — streaming DeepInfra + EXPORT UNIFIÉ
+===========================================================================
 
 Ce que fait ce fichier
+----------------------
 - Endpoints:
   - GET  /health
-  - POST /submit                -> crée un job (déduplication sur hash du texte)
+  - POST /submit                -> crée un job (dédup sur hash du texte)
   - GET  /status?job_id=...     -> état + urls + json_preview (stream live)
   - GET  /results/{job_id}/raw.json | own.csv | feuille_de_charge.xlsx
-- Pipeline:
-  - Appelle DeepInfra en **streaming** (OpenAI-compatible) → met à jour `json_preview`
-  - Tente un parse strict; si échec, **répare** en tronquant au **dernier JSON équilibré** (anti-troncature)
-  - Persist **raw.json** dès que complet (JSON-first)
-  - (optionnel) own.csv (hook prêt)
-  - Génère **feuille_de_charge.xlsx** en fin de job
 
-Variables d'env utiles (HF Space → Settings → Variables & secrets)
-- DEEPINFRA_API_KEY           (obligatoire)
-- RFP_MODEL                   (def: meta-llama/Meta-Llama-3.1-8B-Instruct)
-- RFP_MAX_TOKENS              (def: 600)  ← augmente à 800/900 si tu as souvent de longs JSON
-- RFP_TEMPERATURE             (def: 0.1)
-- RFP_DEBUG                   (1/0)
+- Pipeline:
+  1) Appelle DeepInfra en **streaming** (OpenAI-compatible) → met à jour `json_preview`
+  2) Parse strict puis **répare** si JSON tronqué (trim + fermetures auto)
+  3) **export_outputs(doc, job_dir)** : écrit *raw.json*, *own.csv*, *xlsx* (formules)
+  4) Met à jour les URLs et termine le job
+
+Fonctions exposées (interne API)
+--------------------------------
+- submit(payload) -> {job_id, status}
+- status(job_id)  -> état + urls
+- download endpoints pour raw.json / own.csv / xlsx
+
+Logs
+----
+- Préfixes: [API], [REPAIR]
 """
 
 from __future__ import annotations
 from typing import Dict, Any, Tuple, Optional, Callable
-import os, json, uuid, threading, time, traceback
+import os, json, uuid, threading, time, traceback, re
 from pathlib import Path
 import logging
 import requests
 
-from fastapi import FastAPI, HTTPException, Query, Request
-from fastapi.responses import JSONResponse, FileResponse, StreamingResponse
+from fastapi import FastAPI, HTTPException, Query
+from fastapi.responses import JSONResponse, FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
 
-# === Imports depuis ta lib (clonée par l'entrypoint via RFPmaster) ===
+# === Imports depuis ta lib (clonée côté Space) ===
+from rfp_parser.exports import export_outputs  # << unifie CSV+XLSX+RAW
 from rfp_parser.prompting import build_chat_payload
-from rfp_parser.exports_xls import build_xls_from_doc
-# from rfp_parser.exports_csv import build_csv_from_doc   # (optionnel)
 
 # --------- Config ---------
 DEEPINFRA_API_KEY = os.environ.get("DEEPINFRA_API_KEY", "")
-MODEL_NAME        = os.environ.get("RFP_MODEL", "NousResearch/Hermes-3-Llama-3.1-70B")
+MODEL_NAME        = os.environ.get("RFP_MODEL", "meta-llama/Meta-Llama-3.1-8B-Instruct")
 DEEPINFRA_URL     = os.environ.get("DEEPINFRA_URL", "https://api.deepinfra.com/v1/openai/chat/completions")
-RFP_DEBUG         = str(os.environ.get("RFP_DEBUG", "0")).lower() in {"1", "true", "yes"}
-RFP_MAX_TOKENS    = int(os.environ.get("RFP_MAX_TOKENS", "6000"))
+RFP_DEBUG         = str(os.environ.get("RFP_DEBUG", "0")).lower() in {"1","true","yes"}
+RFP_MAX_TOKENS    = int(os.environ.get("RFP_MAX_TOKENS", "800"))
 RFP_TEMPERATURE   = float(os.environ.get("RFP_TEMPERATURE", "0.1"))
 
 BASE_TMP          = Path("/tmp/rfp_jobs"); BASE_TMP.mkdir(parents=True, exist_ok=True)
@@ -62,7 +65,7 @@ logger.setLevel(logging.DEBUG if RFP_DEBUG else logging.INFO)
 # --------- Jobs en mémoire ---------
 JOBS: Dict[str, Dict[str, Any]] = {}
 JOBS_LOCK = threading.Lock()
-TEXT2JOB: Dict[str, str] = {}  # hash(text) -> job_id (cache dédup)
+TEXT2JOB: Dict[str, str] = {}
 
 def _hash_text(text: str) -> str:
     import hashlib
@@ -105,7 +108,6 @@ def build_payload(text: str) -> Dict[str, Any]:
     base["temperature"] = RFP_TEMPERATURE
     base["max_tokens"] = RFP_MAX_TOKENS
     base["stream"] = True
-    # DeepInfra (OpenAI-compat) accepte normalement response_format json_object
     base["response_format"] = {"type": "json_object"}
     return base
 
@@ -136,71 +138,74 @@ def call_deepinfra_stream(payload: Dict[str, Any], on_chunk: Callable[[str], Non
             on_chunk(delta)
     return "".join(buf)
 
-# --------- JSON Repair helpers ---------
-def _truncate_to_last_balanced_json(s: str) -> Optional[str]:
-    """
-    Parcourt le texte et retourne la **plus longue sous-chaîne initiale** dont
-    les accolades/crochets sont **équilibrés** en dehors des chaînes.
-    Utile quand le modèle est tronqué en plein milieu d'un objet.
-    """
+# --------- JSON Repair robuste ---------
+_WS_COMMA_TAIL = re.compile(r"[ \t\r\n,]+$")
+
+def _scan_stack(s: str):
     stack = []
     in_str = False
     esc = False
-    last_ok = None
-    for i, ch in enumerate(s):
+    valid_boundary = False
+    for ch in s:
         if in_str:
-            if esc:
-                esc = False
-            elif ch == '\\':
-                esc = True
-            elif ch == '"':
-                in_str = False
+            if esc: esc = False
+            elif ch == '\\': esc = True
+            elif ch == '"':  in_str = False
+            continue
+        if ch == '"':
+            in_str = True; valid_boundary = False
+        elif ch in "{[":
+            stack.append(ch); valid_boundary = False
+        elif ch in "}]":
+            if not stack: return None, False, False
+            op = stack.pop()
+            if (op == "{" and ch != "}") or (op == "[" and ch != "]"):
+                return None, False, False
+            valid_boundary = True
+        elif ch == ",":
+            valid_boundary = False
+        elif ch in " \t\r\n":
+            pass
         else:
-            if ch == '"':
-                in_str = True
-            elif ch in '{[':
-                stack.append(ch)
-            elif ch in '}]':
-                if not stack:
-                    # plus de fermetures que d'ouvertures → JSON corrompu
-                    return None
-                op = stack.pop()
-                if (op == '{' and ch != '}') or (op == '[' and ch != ']'):
-                    return None
-                if not stack:
-                    # un objet/array top-level est complet ici
-                    last_ok = i + 1
-            else:
-                pass
-    if last_ok is not None:
-        return s[:last_ok]
+            valid_boundary = True
+    return stack, in_str, valid_boundary
+
+def _close_stack(stack):
+    return "".join("}" if op == "{" else "]" for op in reversed(stack))
+
+def _attempt_repair_json(txt: str, max_trim: int = 2000) -> Optional[Dict[str, Any]]:
+    raw = (txt or "").strip().strip("`")
+    n = len(raw)
+    try:
+        return json.loads(raw)
+    except Exception:
+        pass
+    for cut in range(0, min(max_trim, n)):
+        seg = raw[: n - cut].rstrip()
+        seg = _WS_COMMA_TAIL.sub("", seg)
+        res = _scan_stack(seg)
+        if res is None:
+            continue
+        stack, in_str, boundary = res
+        if in_str:
+            continue
+        candidate = seg + (_close_stack(stack) if stack else "")
+        try:
+            return json.loads(candidate)
+        except Exception:
+            continue
     return None
 
 def _parse_with_repair(full_txt: str) -> Dict[str, Any]:
-    """
-    Essaie d’abord un parse strict; si échec, tente une **troncature sûre**
-    au dernier JSON équilibré (permet d’éviter les plantages pour une fin coupée).
-    """
     txt = (full_txt or "").strip().strip("`")
-    # 1) parse strict
     try:
         return json.loads(txt)
     except Exception as e1:
-        # 2) strip extra + retry
-        try:
-            return json.loads(txt.strip())
-        except Exception as e2:
-            # 3) tentative de troncature équilibrée
-            repaired = _truncate_to_last_balanced_json(txt)
-            if repaired:
-                try:
-                    logger.warning("[REPAIR] JSON tronqué détecté → troncature sûre appliquée (len=%d -> %d)",
-                                   len(txt), len(repaired))
-                    return json.loads(repaired)
-                except Exception as e3:
-                    pass
-            # 4) impossible de réparer proprement
-            raise RuntimeError(f"JSON invalide renvoyé par le modèle: {e2}\n---\n{txt[:4000]}")
+        fixed = _attempt_repair_json(txt)
+        if fixed is not None:
+            logger.warning("[REPAIR] JSON incomplet → réparation réussie")
+            return fixed
+        raise RuntimeError(f"JSON invalide renvoyé par le modèle: {e1}\n---\n{txt[:4000]}")
 
 # --------- Parsing streaming (avec preview) ---------
 def parse_streaming(text: str, on_preview: Callable[[str], None]) -> Dict[str, Any]:
@@ -212,39 +217,7 @@ def parse_streaming(text: str, on_preview: Callable[[str], None]) -> Dict[str, A
         acc.append(d)
         on_preview(("".join(acc))[:1500])  # preview tronquée
     full_txt = call_deepinfra_stream(payload, _on_chunk)
-    # Parse strict + auto-repair en cas de troncature
     return _parse_with_repair(full_txt)
-
-# --------- Persistences ---------
-def persist_doc(job_dir: Path, doc: Dict[str, Any]) -> Tuple[str, str]:
-    job_dir.mkdir(parents=True, exist_ok=True)
-    raw_path = job_dir / "raw.json"
-    with open(raw_path, "w", encoding="utf-8") as f:
-        json.dump(doc, f, indent=2, ensure_ascii=False)
-    raw_url = f"/results/{job_dir.name}/raw.json"
-    return str(raw_path), raw_url
-
-def build_csv_if_available(doc: Dict[str, Any], job_dir: Path) -> Tuple[Optional[str], Optional[str]]:
-    try:
-        # Exemple si tu actives l'export CSV :
-        # out_path = job_dir / "own.csv"
-        # build_csv_from_doc(doc, str(out_path))
-        # return str(out_path), f"/results/{job_dir.name}/own.csv"
-        return None, None
-    except Exception as e:
-        logger.warning("CSV non généré: %s", e)
-        return None, None
-
-def build_xlsx(doc: Dict[str, Any], job_dir: Path) -> str:
-    job_dir.mkdir(parents=True, exist_ok=True)
-    out_path = str(job_dir / "feuille_de_charge.xlsx")
-    baseline = (doc.get("assumptions") or {}).get("baseline_uop_kg") or 100.0
-    try:
-        baseline = float(baseline)
-    except Exception:
-        baseline = 100.0
-    build_xls_from_doc(doc, out_path, baseline_kg=baseline)
-    return out_path
 
 # --------- Orchestrateur ---------
 def run_job(job_id: str, text: str, text_hash: str) -> None:
@@ -257,35 +230,38 @@ def run_job(job_id: str, text: str, text_hash: str) -> None:
             set_job_status(job_id, json_preview=pre)
         doc = parse_streaming(text, on_preview=_push_preview)
 
-        # 2) raw.json immédiatement
-        raw_path, raw_url = persist_doc(job_dir, doc)
-        set_job_status(job_id, raw_json_path=raw_path, raw_json_url=raw_url)
+        # 2) EXPORT UNIFIÉ (écrit raw.json, own.csv, xlsx)
+        job_dir.mkdir(parents=True, exist_ok=True)
+        outs = export_outputs(doc, job_dir, write_xlsx=True, use_enrich=True)
 
-        # 3) own.csv (optionnel)
-        csv_path, csv_url = build_csv_if_available(doc, job_dir)
-        if csv_path and csv_url:
-            set_job_status(job_id, own_csv_path=csv_path, own_csv_url=csv_url)
+        raw_path = outs.get("raw_json")
+        own_path = outs.get("own_csv")
+        xlsx_path = outs.get("xlsx")
 
-        # 4) XLSX
-        xlsx_path = build_xlsx(doc, job_dir)
-        xlsx_url = f"/results/{job_id}/feuille_de_charge.xlsx"
+        set_job_status(
+            job_id,
+            raw_json_path=raw_path,
+            raw_json_url=(f"/results/{job_id}/raw.json" if raw_path else None),
+            own_csv_path=own_path,
+            own_csv_url=(f"/results/{job_id}/own.csv" if own_path else None),
+            xlsx_path=xlsx_path,
+            xlsx_url=(f"/results/{job_id}/feuille_de_charge.xlsx" if xlsx_path else None),
+        )
 
-        # 5) fin
+        # 3) fin
         set_job_status(
             job_id,
             status="done",
-            xlsx_path=xlsx_path,
-            xlsx_url=xlsx_url,
             done_at=time.time(),
-            meta={**JOBS[job_id]["meta"], "assumptions": doc.get("assumptions"), "elapsed_s": round(time.time()-t0, 3)},
+            meta={**JOBS[job_id]["meta"], "elapsed_s": round(time.time()-t0, 3)},
         )
-        logger.info("Job %s terminé en %.3fs -> %s", job_id, time.time()-t0, xlsx_path)
+        logger.info("Job %s terminé en %.3fs", job_id, time.time()-t0)
     except Exception as e:
         logger.error("Job %s échoué: %s\n%s", job_id, e, traceback.format_exc())
         set_job_status(job_id, status="error", error=str(e), done_at=time.time())
 
 # --------- FastAPI app ---------
-app = FastAPI(title="RFP_MASTER API", version="1.3.0")
+app = FastAPI(title="RFP_MASTER API", version="1.5.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -338,10 +314,10 @@ def download_raw(job_id: str):
         info = JOBS.get(job_id)
     if not info:
         raise HTTPException(404, f"job_id inconnu: {job_id}")
-    raw_path = info.get("raw_json_path")
-    if not raw_path or not Path(raw_path).exists():
+    p = info.get("raw_json_path")
+    if not p or not Path(p).exists():
         raise HTTPException(404, "raw.json indisponible.")
-    return FileResponse(raw_path, media_type="application/json", filename="raw.json")
+    return FileResponse(p, media_type="application/json", filename="raw.json")
 
 @app.get("/results/{job_id}/own.csv")
 def download_csv(job_id: str):
@@ -349,12 +325,10 @@ def download_csv(job_id: str):
         info = JOBS.get(job_id)
     if not info:
         raise HTTPException(404, f"job_id inconnu: {job_id}")
-    csv_path = info.get("own_csv_path")
-    if not csv_path:
-        raise HTTPException(404, "own.csv non généré sur ce job.")
-    if not Path(csv_path).exists():
+    p = info.get("own_csv_path")
+    if not p or not Path(p).exists():
         raise HTTPException(404, "own.csv indisponible.")
-    return FileResponse(csv_path, media_type="text/csv", filename="own.csv")
+    return FileResponse(p, media_type="text/csv", filename="own.csv")
 
 @app.get("/results/{job_id}/feuille_de_charge.xlsx")
 def download_xlsx(job_id: str):
@@ -364,11 +338,11 @@ def download_xlsx(job_id: str):
         raise HTTPException(404, f"job_id inconnu: {job_id}")
     if info.get("status") != "done":
         raise HTTPException(409, f"job {job_id} non prêt (status={info.get('status')})")
-    xlsx_path = info.get("xlsx_path")
-    if not xlsx_path or not Path(xlsx_path).exists():
-        raise HTTPException(404, "Fichier indisponible.")
+    p = info.get("xlsx_path")
+    if not p or not Path(p).exists():
+        raise HTTPException(404, "XLSX indisponible.")
     return FileResponse(
-        xlsx_path,
+        p,
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         filename="feuille_de_charge.xlsx",
     )
