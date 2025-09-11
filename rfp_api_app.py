@@ -4,33 +4,51 @@
 API FastAPI pour RFP Parser & Exports — streaming DeepInfra + EXPORT UNIFIÉ
 ===========================================================================
 
-Version modifiée : pretty JSON preview
--------------------------------------
-Modifs principales :
-- Ajout d'un pretty-printer progressif pour la preview stockée dans JOBS[job_id]['json_preview'].
-  - On tente une réparation/parse via _attempt_repair_json(buffer) et on pretty-print si possible.
-  - Sinon, fallback soft pretty pour améliorer la lisibilité (retours-lignes après '},', '],', '}{', ...).
-- Preview tronquée (MAX_PREVIEW_CHARS) pour éviter d'envoyer trop de données au front.
-- Contrôlé par l'env var PRETTY_JSON_STREAM (si True on tente le pretty, sinon on garde le comportement simple).
-- Logs [PREVIEW] ajoutés pour debug.
+But principal
+-------------
+- Expose une API simple (POST /submit, GET /status, GET /results/...) pour lancer le parsing RFP
+  via DeepInfra (streaming) et produire raw.json / own.csv / feuille_de_charge.xlsx.
+- Fournit un preview JSON "live" pendant tout le streaming : JOBS[job_id]['json_preview'].
+  Ce preview est maintenant fourni de façon progressive et "pretty" au fur et à mesure des chunks
+  reçus depuis DeepInfra (indentation, nouveaux retours-lignes, etc.), afin que l'UI puisse
+  afficher un JSON lisible même en milieu de traitement.
 
-Rappel endpoints exposés :
-- GET  /health
-- POST /submit
-- GET  /status?job_id=...
-- GET  /results/{job_id}/raw.json | own.csv | feuille_de_charge.xlsx
+Fonctions clefs et rôle
+----------------------
+- new_job(text_hash, text) -> job_id
+    crée la structure JOBS et renvoie un id.
+- set_job_status(job_id, **updates)
+    met à jour atomiquement JOBS (via JOBS_LOCK).
+- call_deepinfra_stream(payload, on_chunk) -> str
+    effectue la requête POST streamée vers DeepInfra et appelle `on_chunk(delta)` pour chaque
+    delta textuel reçu. Retourne la concaténation complète (string) pour compatibilité.
+- _soft_pretty_chunk(chunk: str, indent_level: int) -> (str, int)
+    pretty-print incrémental d'un chunk JSON incomplet (retourne fragment + nouveau indent).
+- parse_streaming(text: str, on_preview: Callable[[str], None]) -> Dict[str,Any]
+    *NOVEL*: appelle DeepInfra en streaming; pour chaque delta, formate un fragment pretty via
+    `_soft_pretty_chunk` (ou fallback _format_preview), met à jour la preview et l'envoie via
+    on_preview(pretty_fragment_trimmed). A la fin renvoie le JSON final (avec tentative de réparation).
+- run_job(job_id, text, text_hash)
+    orchestration (streaming preview → export_outputs → mise à jour JOBS).
 
-Important :
-- Ce fichier remplace entièrement l'ancien rfp_api_app.py (copie complète incluse).
-- Après déploiement, définis PRETTY_JSON_STREAM=1 et relance l'app (si tu veux forcer l'affichage pretty).
+Activation
+----------
+- PRETTY_JSON_STREAM (env var): si True (default), on utilise le pretty streaming incrémental.
+- MAX_PREVIEW_CHARS: longueur max du preview envoyé au client (default 1500).
+
+Notes de debug
+--------------
+- Les logs [PREVIEW] indiquent la taille et aident à diagnostiquer.
+- Le pretty streaming est très robuste pour la majorité des sorties JSON partielles; s'il y a du texte non-JSON (commentaires du modèle, meta header) la réparation finale s'en occupera.
 """
 
 from __future__ import annotations
-from typing import Dict, Any, Tuple, Optional, Callable
+from typing import Dict, Any, Tuple, Optional, Callable, List
 import os, json, uuid, threading, time, traceback, re
 from pathlib import Path
 import logging
 import requests
+import html
 
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import JSONResponse, FileResponse
@@ -38,7 +56,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
 
 # === Imports depuis ta lib (clonée côté Space) ===
-from rfp_parser.exports import export_outputs  # << unifie CSV+XLSX+RAW
+# (ces modules doivent exister dans ton repo)
+from rfp_parser.exports import export_outputs
 from rfp_parser.prompting import build_chat_payload
 
 # --------- Config ---------
@@ -136,10 +155,8 @@ def call_deepinfra_stream(payload: Dict[str, Any], on_chunk: Callable[[str], Non
             obj = json.loads(data)
             delta = obj["choices"][0]["delta"].get("content") or ""
         except Exception:
-            # Si le chunk n'est pas JSON (rare), on l'envoie tel quel
             delta = ""
             try:
-                # tentative : si data lui-même est un string utile
                 delta = data
             except Exception:
                 delta = ""
@@ -220,33 +237,57 @@ def _parse_with_repair(full_txt: str) -> Dict[str, Any]:
             return fixed
         raise RuntimeError(f"JSON invalide renvoyé par le modèle: {e1}\n---\n{txt[:4000]}")
 
-# --------- Helpers preview pretty ----------
+# --------- Soft pretty chunk (incrémental) ----------
+def _soft_pretty_chunk(chunk: str, indent_level: int) -> Tuple[str, int]:
+    """
+    Pretty-print heuristique d'un fragment JSON incomplet.
+    - Retourne (pretty_fragment, new_indent_level)
+    - Gère guillemets / échappements pour ne pas casser les strings.
+    """
+    out: List[str] = []
+    i = 0
+    in_string, escape = False, False
+    while i < len(chunk):
+        ch = chunk[i]
+        if in_string:
+            out.append(ch)
+            if escape:
+                escape = False
+            elif ch == "\\":
+                escape = True
+            elif ch == '"':
+                in_string = False
+            i += 1
+            continue
+        if ch == '"':
+            in_string = True; out.append(ch)
+        elif ch in "{[":
+            out.append(ch); out.append("\n"); indent_level += 1; out.append("  " * indent_level)
+        elif ch in "}]":
+            out.append("\n"); indent_level = max(0, indent_level - 1); out.append("  " * indent_level); out.append(ch)
+        elif ch == ",":
+            out.append(ch); out.append("\n"); out.append("  " * indent_level)
+        else:
+            out.append(ch)
+        i += 1
+    return "".join(out), indent_level
+
+# --------- Helpers preview pretty (fallbacks) ----------
 def _soft_pretty_fragment(s: str, max_chars: int = MAX_PREVIEW_CHARS) -> str:
-    """
-    Heuristique simple pour rendre lisible un fragment JSON incomplet :
-    - insère retours-ligne après '},' '],', et entre '}{'
-    - tronque proprement
-    """
     if not s:
         return ""
-    # remplacements simples pour lisibilité
     out = s.replace("}{", "}\n{")
     out = out.replace("],", "],\n")
     out = out.replace("},", "},\n")
-    # enlever espaces multiples pour preview compacte
     out = re.sub(r"\s{2,}", " ", out)
-    # tronquer en fin de chaine (garder le début)
     if len(out) > max_chars:
         return out[:max_chars] + "\n... (truncated)"
     return out
 
 def _format_preview(buffer_text: str, max_chars: int = MAX_PREVIEW_CHARS) -> str:
     """
-    Tente :
-    1) json.loads(buffer_text) -> pretty
-    2) _attempt_repair_json(buffer_text) -> pretty
-    3) fallback : _soft_pretty_fragment
-    Toujours renvoie une string (<= max_chars + suffix)
+    Fallback global : tenter json.loads / réparation / soft fragment.
+    (conserve ce comportement pour cas où PRETTY_JSON_STREAM=False)
     """
     if not buffer_text:
         return ""
@@ -255,44 +296,63 @@ def _format_preview(buffer_text: str, max_chars: int = MAX_PREVIEW_CHARS) -> str
         return json.dumps(parsed, indent=2, ensure_ascii=False)[: max_chars]
     except Exception:
         pass
-    # try repair (may close stacks)
     try:
         fixed = _attempt_repair_json(buffer_text, max_trim=5000)
         if fixed is not None:
             return json.dumps(fixed, indent=2, ensure_ascii=False)[: max_chars]
     except Exception:
         pass
-    # fallback soft pretty
     return _soft_pretty_fragment(buffer_text, max_chars=max_chars)
 
-# --------- Parsing streaming (avec preview) ---------
+# --------- Parsing streaming (avec preview progressif) ----------
 def parse_streaming(text: str, on_preview: Callable[[str], None]) -> Dict[str, Any]:
     """
     Envoie la requête en streaming à DeepInfra, construit la preview
-    et retourne le JSON final parsé (avec tentative de réparation si nécessaire).
+    et retourne le JSON final parsé (avec tentative de réparation si nécessaire).
+
+    Nouvelle stratégie pour PRETTY_JSON_STREAM=True:
+      - on applique _soft_pretty_chunk sur chaque delta reçu (conserve indent).
+      - on stocke les fragments pretty dans une liste (buffer_fragments).
+      - on compose la preview courante en joignant et en trimant à MAX_PREVIEW_CHARS.
+      - on envoie la preview via on_preview(preview_str) à chaque chunk.
     """
     if not DEEPINFRA_API_KEY:
         raise RuntimeError("DEEPINFRA_API_KEY manquant.")
     payload = build_payload(text)
     acc = []
-    # local buffer string for preview composition
-    buffer_text = ""
+    buffer_fragments: List[str] = []
+    # indent state for chunk-based pretty
+    indent = 0
 
     def _on_chunk(d: str):
-        nonlocal buffer_text
+        nonlocal indent
         # d est le delta (string) envoyé par DeepInfra (peut être fragmentaire)
         acc.append(d)
-        buffer_text = "".join(acc)
-        # choisir si on pretty-print ou non selon l'env
+
         if PRETTY_JSON_STREAM:
-            pretty = _format_preview(buffer_text, max_chars=MAX_PREVIEW_CHARS)
+            # pretty incremental par-chunk (conserve indent)
+            try:
+                pretty_frag, indent = _soft_pretty_chunk(d, indent)
+                if pretty_frag:
+                    buffer_fragments.append(pretty_frag)
+                # créer un preview trimé : garder la fin la plus significative
+                joined = "".join(buffer_fragments)
+                if len(joined) > MAX_PREVIEW_CHARS * 3:
+                    # pour limiter mémoire, on ne garde qu'une fenêtre raisonnable
+                    joined = joined[-(MAX_PREVIEW_CHARS * 3):]
+                    # re-synchroniser buffer_fragments
+                    buffer_fragments[:] = [joined]
+                preview = joined[-MAX_PREVIEW_CHARS:]
+            except Exception:
+                logger.exception("[PREVIEW] erreur soft pretty chunk; fallback to raw concat")
+                preview = "".join(acc)[-MAX_PREVIEW_CHARS:]
         else:
-            # comportement minimal : preview = début brut
-            pretty = buffer_text[:MAX_PREVIEW_CHARS]
-        # log preview size for debug (truncated)
-        logger.debug("[PREVIEW] len=%d", len(pretty))
+            # fallback: format global (peut être lent)
+            preview = _format_preview("".join(acc), max_chars=MAX_PREVIEW_CHARS)
+
+        logger.debug("[PREVIEW] len=%d indent=%d", len(preview), indent)
         try:
-            on_preview(pretty)
+            on_preview(preview)
         except Exception:
             logger.exception("[API] erreur lors de l'appel on_preview")
 
@@ -427,3 +487,4 @@ def download_xlsx(job_id: str):
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         filename="feuille_de_charge.xlsx",
     )
+
