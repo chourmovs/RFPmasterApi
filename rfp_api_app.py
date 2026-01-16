@@ -52,11 +52,11 @@ from rfp_parser.prompting import build_chat_payload
 
 # --------- Config ---------
 DEEPINFRA_API_KEY = os.environ.get("DEEPINFRA_API_KEY", "")
-MODEL_NAME        = os.environ.get("RFP_MODEL", "NousResearch/Hermes-3-Llama-3.1-70B")
+MODEL_NAME        = os.environ.get("RFP_MODEL", "Qwen/Qwen2.5-72B-Instruct")
 DEEPINFRA_URL     = os.environ.get("DEEPINFRA_URL", "https://api.deepinfra.com/v1/openai/chat/completions")
 RFP_DEBUG         = str(os.environ.get("RFP_DEBUG", "0")).lower() in {"1","true","yes"}
-RFP_MAX_TOKENS    = int(os.environ.get("RFP_MAX_TOKENS", "8000"))
-RFP_TEMPERATURE   = float(os.environ.get("RFP_TEMPERATURE", "0.1"))
+RFP_MAX_TOKENS    = int(os.environ.get("RFP_MAX_TOKENS", "15000"))
+RFP_TEMPERATURE   = float(os.environ.get("RFP_TEMPERATURE", "0.05"))
 
 PRETTY_JSON_STREAM = str(os.environ.get("PRETTY_JSON_STREAM", "1")).lower() in {"1","true","yes"}
 MAX_PREVIEW_CHARS = int(os.environ.get("MAX_PREVIEW_CHARS", "1500"))
