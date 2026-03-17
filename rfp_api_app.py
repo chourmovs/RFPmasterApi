@@ -51,7 +51,6 @@ from rfp_parser.exports import export_outputs
 from rfp_parser.prompting import build_chat_payload
 
 # --------- Config ---------
-# --------- Config ---------
 def _env_first(*names: str, default: str = "") -> str:
     for name in names:
         v = os.environ.get(name)
@@ -113,6 +112,14 @@ RFP_TEMPERATURE = _env_float(
 
 PRETTY_JSON_STREAM = _env_bool("PRETTY_JSON_STREAM", default=True)
 MAX_PREVIEW_CHARS = _env_int("MAX_PREVIEW_CHARS", default=1500)
+
+logger = logging.getLogger("RFP_API")
+if not logger.handlers:
+    h = logging.StreamHandler()
+    h.setFormatter(logging.Formatter("[API] %(levelname)s: %(message)s"))
+    logger.addHandler(h)
+logger.setLevel(logging.DEBUG if RFP_DEBUG else logging.INFO)
+
 
 # --------- Jobs en mémoire ---------
 JOBS: Dict[str, Dict[str, Any]] = {}
