@@ -51,24 +51,68 @@ from rfp_parser.exports import export_outputs
 from rfp_parser.prompting import build_chat_payload
 
 # --------- Config ---------
-DEEPINFRA_API_KEY = os.environ.get("DEEPINFRA_API_KEY", "")
-MODEL_NAME        = os.environ.get("RFP_MODEL", "Qwen/Qwen2.5-72B-Instruct")
-DEEPINFRA_URL     = os.environ.get("DEEPINFRA_URL", "https://api.deepinfra.com/v1/openai/chat/completions")
-RFP_DEBUG         = str(os.environ.get("RFP_DEBUG", "0")).lower() in {"1","true","yes"}
-RFP_MAX_TOKENS    = int(os.environ.get("RFP_MAX_TOKENS", "15000"))
-RFP_TEMPERATURE   = float(os.environ.get("RFP_TEMPERATURE", "0.05"))
+# --------- Config ---------
+def _env_first(*names: str, default: str = "") -> str:
+    for name in names:
+        v = os.environ.get(name)
+        if v is not None and str(v).strip() != "":
+            return str(v).strip()
+    return default
 
-PRETTY_JSON_STREAM = str(os.environ.get("PRETTY_JSON_STREAM", "1")).lower() in {"1","true","yes"}
-MAX_PREVIEW_CHARS = int(os.environ.get("MAX_PREVIEW_CHARS", "1500"))
+def _env_bool(*names: str, default: bool = False) -> bool:
+    v = _env_first(*names, default=str(int(default)))
+    return v.lower() in {"1", "true", "yes", "on"}
 
-BASE_TMP          = Path("/tmp/rfp_jobs"); BASE_TMP.mkdir(parents=True, exist_ok=True)
+def _env_int(*names: str, default: int) -> int:
+    v = _env_first(*names, default=str(default))
+    try:
+        return int(v)
+    except Exception:
+        return default
 
-logger = logging.getLogger("RFP_API")
-if not logger.handlers:
-    h = logging.StreamHandler()
-    h.setFormatter(logging.Formatter("[API] %(levelname)s: %(message)s"))
-    logger.addHandler(h)
-logger.setLevel(logging.DEBUG if RFP_DEBUG else logging.INFO)
+def _env_float(*names: str, default: float) -> float:
+    v = _env_first(*names, default=str(default))
+    try:
+        return float(v)
+    except Exception:
+        return default
+
+DEEPINFRA_API_KEY = _env_first("DEEPINFRA_API_KEY", "OPENAI_API_KEY", default="")
+
+MODEL_NAME = _env_first(
+    "RFP_MODEL",          # ancien nom spécifique API
+    "LLM_MODEL",          # nom canonique de ta stack
+    "DEEPINFRA_MODEL",    # compat historique
+    "OPENAI_MODEL",       # compat OpenAI-like
+    "MODEL",              # compat générique
+    default="deepseek-ai/DeepSeek-V3.1-Terminus",
+)
+
+DEEPINFRA_URL = _env_first(
+    "DEEPINFRA_URL",      # ancien nom spécifique API
+    "LLM_BASE_URL",       # nom canonique possible
+    "DEEPINFRA_BASE_URL", # ton .env actuel
+    "OPENAI_BASE_URL",    # compat OpenAI-like
+    default="https://api.deepinfra.com/v1/openai/chat/completions",
+)
+
+RFP_DEBUG = _env_bool("RFP_DEBUG", default=False)
+
+RFP_MAX_TOKENS = _env_int(
+    "RFP_MAX_TOKENS",     # ancien nom spécifique API
+    "LLM_MAX_TOKENS",     # ton .env actuel
+    "MAX_NEW_TOKENS",
+    default=20000,
+)
+
+RFP_TEMPERATURE = _env_float(
+    "RFP_TEMPERATURE",    # ancien nom spécifique API
+    "LLM_TEMPERATURE",    # ton .env actuel
+    default=0.1,
+)
+
+PRETTY_JSON_STREAM = _env_bool("PRETTY_JSON_STREAM", default=True)
+MAX_PREVIEW_CHARS = _env_int("MAX_PREVIEW_CHARS", default=1500)
 
 # --------- Jobs en mémoire ---------
 JOBS: Dict[str, Dict[str, Any]] = {}
