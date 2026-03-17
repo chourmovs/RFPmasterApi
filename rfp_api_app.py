@@ -12,20 +12,14 @@ But principal
   si réussi, on publie le JSON complet et pretty — ce qui garantit que l'UI peut afficher
   en permanence une version pretty et valide (ou la dernière valide + fragment incomplet).
 
-Fonctions clefs et usage
------------------------
-- new_job(text_hash, text) -> job_id
-    crée la structure JOBS en mémoire.
-- set_job_status(job_id, **updates)
-    met à jour JOBS (protégé par JOBS_LOCK).
-- call_deepinfra_stream(payload, on_chunk) -> str
-    interroge DeepInfra en streaming ; appelle on_chunk(delta) pour chaque fragment.
-- _attempt_repair_json(txt, max_trim)
-    tentative de réparation par troncature et fermeture de stack.
-- parse_streaming(text, on_preview) -> Dict[str,Any]
-    fait le streaming, applique réparation live par chunk et appelle on_preview(pretty_str).
-- run_job(job_id, text, text_hash)
-    orchestrateur : streaming → export_outputs → mise à jour JOBS.
+Points de robustesse ajoutés
+----------------------------
+- Résolution d'env multi-clés sans dépendre d'un modèle hardcodé Qwen.
+- URL DeepInfra normalisée pour accepter soit une base URL, soit l'endpoint complet.
+- Logger stable sans duplication de handlers.
+- BASE_TMP défini explicitement et configurable.
+- /status non destructif pour le polling frontend (retourne 200 + status=missing).
+- run_job encapsulé proprement pour éviter les crashs “sales” de thread.
 """
 from __future__ import annotations
 
@@ -84,6 +78,27 @@ def _env_float(*names: str, default: float) -> float:
         return default
 
 
+def _normalize_chat_completions_url(raw_url: str) -> str:
+    """
+    Accepte :
+    - endpoint complet: https://.../chat/completions
+    - base OpenAI-like: https://.../v1/openai
+    - base /v1:        https://.../v1
+    et renvoie toujours un endpoint POSTable pour chat completions.
+    """
+    url = (raw_url or "").strip().rstrip("/")
+    if not url:
+        return "https://api.deepinfra.com/v1/openai/chat/completions"
+
+    if url.endswith("/chat/completions"):
+        return url
+
+    if url.endswith("/v1/openai") or url.endswith("/v1"):
+        return f"{url}/chat/completions"
+
+    return f"{url}/chat/completions"
+
+
 # --------- Config ---------
 DEEPINFRA_API_KEY = _env_first("DEEPINFRA_API_KEY", "OPENAI_API_KEY", default="")
 
@@ -96,13 +111,14 @@ MODEL_NAME = _env_first(
     default="deepseek-ai/DeepSeek-V3.1-Terminus",
 )
 
-DEEPINFRA_URL = _env_first(
-    "DEEPINFRA_URL",      # ancien nom spécifique API
+DEEPINFRA_BASE_OR_URL = _env_first(
+    "DEEPINFRA_URL",      # ancien nom spécifique API, parfois endpoint complet
     "LLM_BASE_URL",       # éventuel alias canonique
-    "DEEPINFRA_BASE_URL", # .env courant
+    "DEEPINFRA_BASE_URL", # .env courant, souvent base URL
     "OPENAI_BASE_URL",    # compat OpenAI-like
     default="https://api.deepinfra.com/v1/openai/chat/completions",
 )
+DEEPINFRA_URL = _normalize_chat_completions_url(DEEPINFRA_BASE_OR_URL)
 
 RFP_DEBUG = _env_bool("RFP_DEBUG", default=False)
 
@@ -138,10 +154,11 @@ logger.propagate = False
 logger.setLevel(logging.DEBUG if RFP_DEBUG else logging.INFO)
 
 logger.info(
-    "Boot config | model=%s max_tokens=%s temperature=%s base_url=%s tmp=%s",
+    "Boot config | model=%s max_tokens=%s temperature=%s raw_url=%s resolved_url=%s tmp=%s",
     MODEL_NAME,
     RFP_MAX_TOKENS,
     RFP_TEMPERATURE,
+    DEEPINFRA_BASE_OR_URL,
     DEEPINFRA_URL,
     BASE_TMP,
 )
@@ -216,9 +233,25 @@ def _iter_deepinfra_stream(payload: Dict[str, Any]):
         "Authorization": f"Bearer {DEEPINFRA_API_KEY}",
         "Content-Type": "application/json",
     }
+
+    logger.info(
+        "DeepInfra request | model=%s url=%s stream=%s max_tokens=%s temperature=%s",
+        payload.get("model"),
+        DEEPINFRA_URL,
+        payload.get("stream"),
+        payload.get("max_tokens"),
+        payload.get("temperature"),
+    )
+
     with _session.post(DEEPINFRA_URL, headers=headers, json=payload, timeout=180, stream=True) as r:
         if r.status_code // 100 != 2:
-            raise RuntimeError(f"DeepInfra HTTP {r.status_code}: {r.text}")
+            body = ""
+            try:
+                body = r.text
+            except Exception:
+                body = "<unreadable response body>"
+            raise RuntimeError(f"DeepInfra HTTP {r.status_code}: {body}")
+
         for line in r.iter_lines(decode_unicode=True):
             if not line:
                 continue
@@ -245,6 +278,7 @@ def call_deepinfra_stream(payload: Dict[str, Any], on_chunk: Callable[[str], Non
                 delta = data
             except Exception:
                 delta = ""
+
         if delta:
             buf.append(delta)
             try:
@@ -263,6 +297,7 @@ def _scan_stack(s: str):
     in_str = False
     esc = False
     valid_boundary = False
+
     for ch in s:
         if in_str:
             if esc:
@@ -272,6 +307,7 @@ def _scan_stack(s: str):
             elif ch == '"':
                 in_str = False
             continue
+
         if ch == '"':
             in_str = True
             valid_boundary = False
@@ -291,6 +327,7 @@ def _scan_stack(s: str):
             pass
         else:
             valid_boundary = True
+
     return stack, in_str, valid_boundary
 
 
@@ -305,10 +342,12 @@ def _attempt_repair_json(txt: str, max_trim: int = 2000) -> Optional[Dict[str, A
     """
     raw = (txt or "").strip().strip("`")
     n = len(raw)
+
     try:
         return json.loads(raw)
     except Exception:
         pass
+
     for cut in range(0, min(max_trim, n)):
         seg = raw[: n - cut].rstrip()
         seg = _WS_COMMA_TAIL.sub("", seg)
@@ -316,6 +355,7 @@ def _attempt_repair_json(txt: str, max_trim: int = 2000) -> Optional[Dict[str, A
         if res is None:
             continue
         stack, in_str, boundary = res
+        _ = boundary
         if in_str:
             continue
         candidate = seg + (_close_stack(stack) if stack else "")
@@ -323,6 +363,7 @@ def _attempt_repair_json(txt: str, max_trim: int = 2000) -> Optional[Dict[str, A
             return json.loads(candidate)
         except Exception:
             continue
+
     return None
 
 
@@ -343,6 +384,7 @@ def _soft_pretty_chunk(chunk: str, indent_level: int) -> Tuple[str, int]:
     out: List[str] = []
     i = 0
     in_string, escape = False, False
+
     while i < len(chunk):
         ch = chunk[i]
         if in_string:
@@ -355,6 +397,7 @@ def _soft_pretty_chunk(chunk: str, indent_level: int) -> Tuple[str, int]:
                 in_string = False
             i += 1
             continue
+
         if ch == '"':
             in_string = True
             out.append(ch)
@@ -375,16 +418,19 @@ def _soft_pretty_chunk(chunk: str, indent_level: int) -> Tuple[str, int]:
         else:
             out.append(ch)
         i += 1
+
     return "".join(out), indent_level
 
 
 def _soft_pretty_fragment(s: str, max_chars: int = MAX_PREVIEW_CHARS) -> str:
     if not s:
         return ""
+
     out = s.replace("}{", "}\n{")
     out = out.replace("],", "],\n")
     out = out.replace("},", "},\n")
     out = re.sub(r"\s{2,}", " ", out)
+
     if len(out) > max_chars:
         return out[:max_chars] + "\n... (truncated)"
     return out
@@ -399,6 +445,7 @@ def parse_streaming(text: str, on_preview: Callable[[str], None]) -> Dict[str, A
     """
     if not DEEPINFRA_API_KEY:
         raise RuntimeError("DEEPINFRA_API_KEY manquant.")
+
     payload = build_payload(text)
     acc_parts: List[str] = []
     acc_text = ""
@@ -414,6 +461,7 @@ def parse_streaming(text: str, on_preview: Callable[[str], None]) -> Dict[str, A
 
     def _on_chunk(d: str):
         nonlocal acc_text, last_valid_pretty, indent
+
         acc_parts.append(d)
         acc_text = "".join(acc_parts)
 
@@ -428,6 +476,7 @@ def parse_streaming(text: str, on_preview: Callable[[str], None]) -> Dict[str, A
                 pretty_all = json.dumps(repaired, indent=2, ensure_ascii=False)
             except Exception:
                 pretty_all = json.dumps(repaired, indent=2, ensure_ascii=False, default=str)
+
             last_valid_pretty = pretty_all
             _publish(pretty_all)
             logger.debug("[PREVIEW] published repaired JSON (len=%d)", len(pretty_all))
@@ -435,7 +484,7 @@ def parse_streaming(text: str, on_preview: Callable[[str], None]) -> Dict[str, A
 
         try:
             pretty_frag, indent = _soft_pretty_chunk(d, indent)
-            _ = pretty_frag  # conservé pour cohérence / debug éventuel
+            _ = pretty_frag
         except Exception:
             pretty_frag = _soft_pretty_fragment(d)
             _ = pretty_frag
@@ -448,6 +497,7 @@ def parse_streaming(text: str, on_preview: Callable[[str], None]) -> Dict[str, A
             )
         else:
             composed = _soft_pretty_fragment(acc_text, max_chars=MAX_PREVIEW_CHARS)
+
         _publish(composed)
         logger.debug(
             "[PREVIEW] published heuristic fragment (len=%d) last_valid=%s",
@@ -510,7 +560,7 @@ def run_job(job_id: str, text: str, text_hash: str) -> None:
 
 
 # --------- FastAPI app ---------
-app = FastAPI(title="RFP_MASTER API", version="1.5.1")
+app = FastAPI(title="RFP_MASTER API", version="1.5.2")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -529,7 +579,8 @@ def health():
         "model": MODEL_NAME,
         "max_tokens": RFP_MAX_TOKENS,
         "temperature": RFP_TEMPERATURE,
-        "base_url": DEEPINFRA_URL,
+        "base_or_url_raw": DEEPINFRA_BASE_OR_URL,
+        "resolved_chat_url": DEEPINFRA_URL,
         "tmp_dir": str(BASE_TMP),
         "env_model_sources": {
             "RFP_MODEL": os.environ.get("RFP_MODEL"),
