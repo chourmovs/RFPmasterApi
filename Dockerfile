@@ -26,4 +26,8 @@ RUN mkdir -p /opt/workspace \
     && git clone --depth=1 --branch "${BRANCH_CORE}" "${GITHUB_REPO_CORE_URL}" "${CORE_DIR}"
 
 RUN if [ -f /app/requirements.txt ]; then pip install --no-cache-dir -r /app/requirements.txt; fi \
-    && if [ -f "${CORE_DIR}/requirements.txt" ]; then pip install --no-cache-dir -r "${CORE_DIR}/requirements.txt;"; fi
+    && if [ -f "${CORE_DIR}/requirements.txt" ]; then pip install --no-cache-dir -r "${CORE_DIR}/requirements.txt"; fi
+
+EXPOSE 8000
+
+CMD ["python", "-m", "uvicorn", "rfp_api_app:app", "--host", "0.0.0.0", "--port", "8000"]
