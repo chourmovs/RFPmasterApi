@@ -1,10 +1,10 @@
 fastapi==0.115.0
 uvicorn[standard]==0.30.6
 requests==2.32.3
-pydantic>=1.10,<3
-pandas>=2.0
+pydantic>=2,<3
+pandas>=2.2
 openpyxl>=3.1
-# dépendances de ton repo RFPmaster (si besoin)
-# python-dotenv
-# loguru
-
+python-dotenv>=1.0.1
+pyyaml
+openai>=1.40.0
+XlsxWriter>=3.1.0
