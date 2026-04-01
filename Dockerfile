@@ -21,7 +21,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY . /app
 
 ARG GITHUB_REPO_CORE=chourmovs/RFPmaster.git
-ARG BRANCH_CORE=coolify
+ARG BRANCH_CORE=coolify-api
 ARG GITHUB_TOKEN
 
 RUN test -n "$GITHUB_TOKEN" \
