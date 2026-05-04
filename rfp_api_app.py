@@ -1,29 +1,70 @@
 # rfp_api_app.py
 # -*- coding: utf-8 -*-
 """
-API FastAPI pour RFP Parser & Exports — streaming DeepInfra + PRETTY JSON LIVE & REPAIR
-======================================================================================
+API FastAPI pour RFP Parser & Exports — streaming LLM OpenAI-compatible + PRETTY JSON LIVE & REPAIR
+=================================================================================================
 
 But principal
 -------------
-- Expose /submit, /status, /results/* pour lancer le parsing RFP via DeepInfra (streaming).
+- Expose /submit, /status, /results/* pour lancer le parsing RFP via un provider LLM
+  compatible Chat Completions OpenAI-like.
 - Fournit un preview JSON "live" pendant tout le streaming : JOBS[job_id]['json_preview'].
 - Ajoute une REPARATION LIVE : à chaque chunk on tente de réparer le buffer complet et,
   si réussi, on publie le JSON complet et pretty — ce qui garantit que l'UI peut afficher
   en permanence une version pretty et valide (ou la dernière valide + fragment incomplet).
 
-Points de robustesse ajoutés
-----------------------------
-- Résolution d'env multi-clés sans dépendre d'un modèle hardcodé Qwen.
-- URL DeepInfra normalisée pour accepter soit une base URL, soit l'endpoint complet.
-- Logger stable sans duplication de handlers.
-- BASE_TMP défini explicitement et configurable.
-- /status non destructif pour le polling frontend (retourne 200 + status=missing).
-- run_job encapsulé proprement pour éviter les crashs “sales” de thread.
+Ce que propose ce fichier
+-------------------------
+- _env_first / _env_bool / _env_int / _env_float :
+  lecture robuste des variables d'environnement, avec fallback multi-noms.
+- _resolve_llm_config :
+  résolution centralisée du provider actif, du modèle, de la clé API et de l'URL endpoint.
+  Supporte DeepInfra et Fireworks, plus tout endpoint OpenAI-compatible.
+- build_payload :
+  construit le payload Chat Completions en conservant build_chat_payload() comme source
+  de vérité du prompt.
+- call_llm_stream / _iter_llm_stream :
+  appelle le provider actif en streaming SSE et agrège les deltas texte.
+- _attempt_repair_json / _parse_with_repair :
+  répare autant que possible les JSON incomplets générés pendant ou après streaming.
+- parse_streaming :
+  orchestre l'appel LLM, publie la preview live, puis retourne le document JSON final.
+- run_job :
+  exécute un job asynchrone en mémoire, exporte JSON/CSV/XLSX et publie les URLs.
+- /submit :
+  démarre un job. Peut recevoir text, provider, model, temperature, max_tokens.
+- /status :
+  retourne l'état du job et la preview JSON live.
+- /health :
+  expose le diagnostic provider/modèle/url sans fuite de clé API.
+
+Variables d'environnement principales
+-------------------------------------
+Provider :
+- LLM_PROVIDER=deepinfra|fireworks
+- RFP_PROVIDER=deepinfra|fireworks        (alias API optionnel)
+
+DeepInfra :
+- DEEPINFRA_API_KEY
+- DEEPINFRA_MODEL
+- DEEPINFRA_BASE_URL=https://api.deepinfra.com/v1/openai
+
+Fireworks :
+- FIREWORKS_API_KEY
+- FIREWORKS_MODEL=accounts/fireworks/models/...
+- FIREWORKS_BASE_URL=https://api.fireworks.ai/inference/v1
+
+Paramètres communs :
+- RFP_MODEL / LLM_MODEL / MODEL
+- RFP_MAX_TOKENS / LLM_MAX_TOKENS / MAX_NEW_TOKENS
+- RFP_TEMPERATURE / LLM_TEMPERATURE
+- RFP_TMP_DIR
+- RFP_DEBUG=1
 """
 from __future__ import annotations
 
 from typing import Dict, Any, Tuple, Optional, Callable, List
+from dataclasses import dataclass
 import os
 import json
 import uuid
@@ -44,6 +85,13 @@ from fastapi.middleware.gzip import GZipMiddleware
 # === Imports depuis ta lib (clonée côté Space) ===
 from rfp_parser.exports import export_outputs
 from rfp_parser.prompting import build_chat_payload
+
+try:
+    # Compat avec les deux autres fichiers de la branche applicative.
+    # cfg.py contient déjà LLM_PROVIDER, FIREWORKS_* et get_llm_config().
+    from rfp_parser.cfg import get_llm_config as _cfg_get_llm_config
+except Exception:
+    _cfg_get_llm_config = None
 
 
 # -------------------------------------------------------------------
@@ -78,7 +126,42 @@ def _env_float(*names: str, default: float) -> float:
         return default
 
 
-def _normalize_chat_completions_url(raw_url: str) -> str:
+def _normalize_provider(raw_provider: Optional[str]) -> str:
+    provider = (raw_provider or "").strip().lower()
+    if provider in {"firework", "fireworks.ai", "fireworksai", "fw"}:
+        return "fireworks"
+    if provider in {"deepinfra", "deep-infra", "di"}:
+        return "deepinfra"
+    if provider:
+        return provider
+    return ""
+
+
+def _infer_provider_from_env() -> str:
+    """
+    Inférence volontairement prudente :
+    - RFP_PROVIDER / LLM_PROVIDER reste prioritaire.
+    - Si le provider n'est pas défini mais qu'une config Fireworks explicite existe,
+      on bascule sur Fireworks.
+    - Sinon DeepInfra reste le défaut historique.
+    """
+    explicit = _normalize_provider(_env_first("RFP_PROVIDER", "LLM_PROVIDER", default=""))
+    if explicit:
+        return explicit
+
+    fireworks_markers = [
+        os.environ.get("FIREWORKS_API_KEY"),
+        os.environ.get("FIREWORKS_MODEL"),
+        os.environ.get("FIREWORKS_BASE_URL"),
+        os.environ.get("FIREWORKS_URL"),
+    ]
+    if any(str(v or "").strip() for v in fireworks_markers):
+        return "fireworks"
+
+    return "deepinfra"
+
+
+def _normalize_chat_completions_url(raw_url: str, provider: str = "deepinfra") -> str:
     """
     Accepte :
     - endpoint complet: https://.../chat/completions
@@ -86,8 +169,12 @@ def _normalize_chat_completions_url(raw_url: str) -> str:
     - base /v1:        https://.../v1
     et renvoie toujours un endpoint POSTable pour chat completions.
     """
+    provider = _normalize_provider(provider) or "deepinfra"
     url = (raw_url or "").strip().rstrip("/")
+
     if not url:
+        if provider == "fireworks":
+            return "https://api.fireworks.ai/inference/v1/chat/completions"
         return "https://api.deepinfra.com/v1/openai/chat/completions"
 
     if url.endswith("/chat/completions"):
@@ -99,27 +186,46 @@ def _normalize_chat_completions_url(raw_url: str) -> str:
     return f"{url}/chat/completions"
 
 
-# --------- Config ---------
-DEEPINFRA_API_KEY = _env_first("DEEPINFRA_API_KEY", "OPENAI_API_KEY", default="")
+def _mask_secret(value: str) -> str:
+    value = value or ""
+    if not value:
+        return "missing"
+    if len(value) <= 8:
+        return "set-short"
+    return f"{value[:4]}...{value[-4:]}"
 
-MODEL_NAME = _env_first(
-    "RFP_MODEL",          # ancien nom spécifique API
-    "LLM_MODEL",          # canonique stack
-    "DEEPINFRA_MODEL",    # compat historique
-    "OPENAI_MODEL",       # compat OpenAI-like
-    "MODEL",              # compat générique
-    default="deepseek-ai/DeepSeek-V3.1-Terminus",
-)
 
-DEEPINFRA_BASE_OR_URL = _env_first(
-    "DEEPINFRA_URL",      # ancien nom spécifique API, parfois endpoint complet
-    "LLM_BASE_URL",       # éventuel alias canonique
-    "DEEPINFRA_BASE_URL", # .env courant, souvent base URL
-    "OPENAI_BASE_URL",    # compat OpenAI-like
-    default="https://api.deepinfra.com/v1/openai/chat/completions",
-)
-DEEPINFRA_URL = _normalize_chat_completions_url(DEEPINFRA_BASE_OR_URL)
+@dataclass(frozen=True)
+class LLMRuntimeConfig:
+    provider: str
+    model: str
+    api_key: str
+    base_or_url: str
+    chat_url: str
+    max_tokens: int
+    temperature: float
+    source: str
 
+
+def _cfg_snapshot() -> Dict[str, Any]:
+    """
+    Snapshot informatif depuis rfp_parser.cfg si disponible.
+    Ne bloque jamais le boot API : l'API garde ses propres fallbacks.
+    """
+    if _cfg_get_llm_config is None:
+        return {}
+
+    try:
+        cfg = _cfg_get_llm_config()
+        if isinstance(cfg, dict):
+            return dict(cfg)
+    except Exception:
+        return {}
+
+    return {}
+
+
+# --------- Config globale non sensible ---------
 RFP_DEBUG = _env_bool("RFP_DEBUG", default=False)
 
 RFP_MAX_TOKENS = _env_int(
@@ -153,13 +259,142 @@ if not logger.handlers:
 logger.propagate = False
 logger.setLevel(logging.DEBUG if RFP_DEBUG else logging.INFO)
 
+
+def _resolve_llm_config(
+    provider_override: Optional[str] = None,
+    model_override: Optional[str] = None,
+    max_tokens_override: Optional[Any] = None,
+    temperature_override: Optional[Any] = None,
+) -> LLMRuntimeConfig:
+    """
+    Résout provider + modèle + clé + endpoint.
+    Cette fonction est appelée au boot pour les logs, puis par job pour permettre
+    un override /submit sans redémarrer l'API.
+
+    Priorité provider :
+    1. provider_override envoyé dans /submit
+    2. RFP_PROVIDER / LLM_PROVIDER
+    3. présence explicite de variables FIREWORKS_*
+    4. deepinfra historique
+
+    Priorité modèle :
+    - Fireworks : model_override > FIREWORKS_MODEL > LLM_MODEL > RFP_MODEL > MODEL > défaut Fireworks
+    - DeepInfra : model_override > RFP_MODEL > LLM_MODEL > DEEPINFRA_MODEL > OPENAI_MODEL > MODEL > défaut DeepInfra
+    """
+    cfg = _cfg_snapshot()
+    env_provider = _infer_provider_from_env()
+    provider = _normalize_provider(provider_override) or env_provider
+
+    if provider == "fireworks":
+        default_base = "https://api.fireworks.ai/inference/v1"
+        default_model = "accounts/fireworks/models/llama-v3p1-405b-instruct"
+
+        cfg_base = str(cfg.get("base_url") or "").strip() if cfg.get("provider") == "fireworks" else ""
+        cfg_model = str(cfg.get("model") or "").strip() if cfg.get("provider") == "fireworks" else ""
+        cfg_key = str(cfg.get("api_key") or "").strip() if cfg.get("provider") == "fireworks" else ""
+
+        base_or_url = _env_first(
+            "FIREWORKS_URL",
+            "FIREWORKS_BASE_URL",
+            "LLM_BASE_URL",
+            "OPENAI_BASE_URL",
+            default=cfg_base or default_base,
+        )
+        api_key = _env_first(
+            "FIREWORKS_API_KEY",
+            "LLM_API_KEY",
+            "OPENAI_API_KEY",
+            default=cfg_key,
+        )
+        model = (model_override or "").strip() or _env_first(
+            "FIREWORKS_MODEL",
+            "LLM_MODEL",
+            "RFP_MODEL",
+            "MODEL",
+            default=cfg_model or default_model,
+        )
+        source = "fireworks"
+
+    else:
+        provider = provider or "deepinfra"
+        default_base = "https://api.deepinfra.com/v1/openai"
+        default_model = "deepseek-ai/DeepSeek-V3.1-Terminus"
+
+        cfg_base = str(cfg.get("base_url") or "").strip() if cfg.get("provider") == "deepinfra" else ""
+        cfg_model = str(cfg.get("model") or "").strip() if cfg.get("provider") == "deepinfra" else ""
+        cfg_key = str(cfg.get("api_key") or "").strip() if cfg.get("provider") == "deepinfra" else ""
+
+        base_or_url = _env_first(
+            "DEEPINFRA_URL",
+            "LLM_BASE_URL",
+            "DEEPINFRA_BASE_URL",
+            "OPENAI_BASE_URL",
+            default=cfg_base or default_base,
+        )
+        api_key = _env_first(
+            "DEEPINFRA_API_KEY",
+            "LLM_API_KEY",
+            "OPENAI_API_KEY",
+            default=cfg_key,
+        )
+        model = (model_override or "").strip() or _env_first(
+            "RFP_MODEL",
+            "LLM_MODEL",
+            "DEEPINFRA_MODEL",
+            "OPENAI_MODEL",
+            "MODEL",
+            default=cfg_model or default_model,
+        )
+        source = provider
+
+    max_tokens = RFP_MAX_TOKENS
+    if max_tokens_override is not None and str(max_tokens_override).strip() != "":
+        try:
+            max_tokens = int(max_tokens_override)
+        except Exception:
+            logger.warning(
+                "max_tokens override ignoré car invalide: %r | fallback=%s",
+                max_tokens_override,
+                RFP_MAX_TOKENS,
+            )
+
+    temperature = RFP_TEMPERATURE
+    if temperature_override is not None and str(temperature_override).strip() != "":
+        try:
+            temperature = float(temperature_override)
+        except Exception:
+            logger.warning(
+                "temperature override ignorée car invalide: %r | fallback=%s",
+                temperature_override,
+                RFP_TEMPERATURE,
+            )
+
+    chat_url = _normalize_chat_completions_url(base_or_url, provider=provider)
+
+    return LLMRuntimeConfig(
+        provider=provider,
+        model=model,
+        api_key=api_key,
+        base_or_url=base_or_url,
+        chat_url=chat_url,
+        max_tokens=max_tokens,
+        temperature=temperature,
+        source=source,
+    )
+
+
+BOOT_LLM_CONFIG = _resolve_llm_config()
+
 logger.info(
-    "Boot config | model=%s max_tokens=%s temperature=%s raw_url=%s resolved_url=%s tmp=%s",
-    MODEL_NAME,
-    RFP_MAX_TOKENS,
-    RFP_TEMPERATURE,
-    DEEPINFRA_BASE_OR_URL,
-    DEEPINFRA_URL,
+    "Boot config PROVIDER_AWARE_BRANCH_FIX | provider=%s model=%s max_tokens=%s "
+    "temperature=%s base_or_url=%s resolved_chat_url=%s api_key=%s tmp=%s",
+    BOOT_LLM_CONFIG.provider,
+    BOOT_LLM_CONFIG.model,
+    BOOT_LLM_CONFIG.max_tokens,
+    BOOT_LLM_CONFIG.temperature,
+    BOOT_LLM_CONFIG.base_or_url,
+    BOOT_LLM_CONFIG.chat_url,
+    _mask_secret(BOOT_LLM_CONFIG.api_key),
     BASE_TMP,
 )
 
@@ -170,8 +405,21 @@ JOBS_LOCK = threading.Lock()
 TEXT2JOB: Dict[str, str] = {}
 
 
-def _hash_text(text: str) -> str:
-    return hashlib.sha1((text or "").encode("utf-8")).hexdigest()
+def _hash_text(text: str, llm_cfg: Optional[LLMRuntimeConfig] = None) -> str:
+    """
+    Hash de déduplication.
+    On inclut provider + modèle + paramètres d'inférence pour éviter qu'un même texte
+    rejoué avec Fireworks soit confondu avec un ancien job DeepInfra.
+    """
+    cfg = llm_cfg or BOOT_LLM_CONFIG
+    material = {
+        "text": text or "",
+        "provider": cfg.provider,
+        "model": cfg.model,
+        "max_tokens": cfg.max_tokens,
+        "temperature": cfg.temperature,
+    }
+    return hashlib.sha1(json.dumps(material, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()
 
 
 def _safe_job_snapshot(job_id: str) -> Dict[str, Any]:
@@ -180,7 +428,7 @@ def _safe_job_snapshot(job_id: str) -> Dict[str, Any]:
         return dict(info) if info else {}
 
 
-def new_job(text_hash: str, text: str) -> str:
+def new_job(text_hash: str, text: str, llm_cfg: LLMRuntimeConfig) -> str:
     job_id = uuid.uuid4().hex[:12]
     with JOBS_LOCK:
         JOBS[job_id] = {
@@ -195,9 +443,14 @@ def new_job(text_hash: str, text: str) -> str:
             "started_at": time.time(),
             "done_at": None,
             "meta": {
-                "model": MODEL_NAME,
+                "provider": llm_cfg.provider,
+                "model": llm_cfg.model,
                 "length": len(text or ""),
                 "hash": text_hash,
+                "max_tokens": llm_cfg.max_tokens,
+                "temperature": llm_cfg.temperature,
+                "base_or_url": llm_cfg.base_or_url,
+                "resolved_chat_url": llm_cfg.chat_url,
             },
             "json_preview": None,
         }
@@ -211,7 +464,7 @@ def set_job_status(job_id: str, **updates):
             JOBS[job_id].update(**updates)
 
 
-# --------- HTTP session / DeepInfra streaming ---------
+# --------- HTTP session / LLM streaming ---------
 _session = requests.Session()
 _adapter = requests.adapters.HTTPAdapter(pool_connections=8, pool_maxsize=16, max_retries=0)
 _session.mount("http://", _adapter)
@@ -219,38 +472,47 @@ _session.mount("https://", _adapter)
 _session.headers.update({"Connection": "keep-alive"})
 
 
-def build_payload(text: str) -> Dict[str, Any]:
-    base = build_chat_payload(text, model=MODEL_NAME)
-    base["temperature"] = RFP_TEMPERATURE
-    base["max_tokens"] = RFP_MAX_TOKENS
+def build_payload(text: str, llm_cfg: LLMRuntimeConfig) -> Dict[str, Any]:
+    """
+    Construit le payload Chat Completions.
+    build_chat_payload reste responsable du prompt métier sensible.
+    """
+    base = build_chat_payload(text, model=llm_cfg.model)
+    base["model"] = llm_cfg.model
+    base["temperature"] = llm_cfg.temperature
+    base["max_tokens"] = llm_cfg.max_tokens
     base["stream"] = True
     base["response_format"] = {"type": "json_object"}
     return base
 
 
-def _iter_deepinfra_stream(payload: Dict[str, Any]):
+def _iter_llm_stream(payload: Dict[str, Any], llm_cfg: LLMRuntimeConfig):
+    if not llm_cfg.api_key:
+        raise RuntimeError(f"API key manquante pour provider '{llm_cfg.provider}'.")
+
     headers = {
-        "Authorization": f"Bearer {DEEPINFRA_API_KEY}",
+        "Authorization": f"Bearer {llm_cfg.api_key}",
         "Content-Type": "application/json",
     }
 
     logger.info(
-        "DeepInfra request | model=%s url=%s stream=%s max_tokens=%s temperature=%s",
+        "LLM request | provider=%s model=%s url=%s stream=%s max_tokens=%s temperature=%s",
+        llm_cfg.provider,
         payload.get("model"),
-        DEEPINFRA_URL,
+        llm_cfg.chat_url,
         payload.get("stream"),
         payload.get("max_tokens"),
         payload.get("temperature"),
     )
 
-    with _session.post(DEEPINFRA_URL, headers=headers, json=payload, timeout=180, stream=True) as r:
+    with _session.post(llm_cfg.chat_url, headers=headers, json=payload, timeout=180, stream=True) as r:
         if r.status_code // 100 != 2:
             body = ""
             try:
                 body = r.text
             except Exception:
                 body = "<unreadable response body>"
-            raise RuntimeError(f"DeepInfra HTTP {r.status_code}: {body}")
+            raise RuntimeError(f"{llm_cfg.provider} HTTP {r.status_code}: {body}")
 
         for line in r.iter_lines(decode_unicode=True):
             if not line:
@@ -262,16 +524,28 @@ def _iter_deepinfra_stream(payload: Dict[str, Any]):
                 yield data
 
 
-def call_deepinfra_stream(payload: Dict[str, Any], on_chunk: Callable[[str], None]) -> str:
+def call_llm_stream(
+    payload: Dict[str, Any],
+    llm_cfg: LLMRuntimeConfig,
+    on_chunk: Callable[[str], None],
+) -> str:
     """
-    Appelle DeepInfra en streaming et envoie chaque delta via on_chunk.
+    Appelle le provider LLM actif en streaming et envoie chaque delta via on_chunk.
     Retourne la concaténation complète (string).
     """
     buf: List[str] = []
-    for data in _iter_deepinfra_stream(payload):
+    for data in _iter_llm_stream(payload, llm_cfg):
         try:
             obj = json.loads(data)
-            delta = obj["choices"][0]["delta"].get("content") or ""
+            choice = obj.get("choices", [{}])[0]
+            delta_obj = choice.get("delta") or {}
+            delta = delta_obj.get("content") or ""
+
+            # Certains endpoints OpenAI-compatible renvoient parfois un message final
+            # plutôt qu'un delta strict ; on garde ce fallback léger.
+            if not delta:
+                message_obj = choice.get("message") or {}
+                delta = message_obj.get("content") or ""
         except Exception:
             delta = ""
             try:
@@ -286,6 +560,10 @@ def call_deepinfra_stream(payload: Dict[str, Any], on_chunk: Callable[[str], Non
             except Exception:
                 logger.exception("Erreur dans on_chunk callback")
     return "".join(buf)
+
+
+# Alias compat interne si un import local historique s'y attendait.
+call_deepinfra_stream = call_llm_stream
 
 
 # --------- JSON Repair robuste ----------
@@ -437,16 +715,22 @@ def _soft_pretty_fragment(s: str, max_chars: int = MAX_PREVIEW_CHARS) -> str:
 
 
 # --------- Parsing streaming (avec preview + live repair) ----------
-def parse_streaming(text: str, on_preview: Callable[[str], None]) -> Dict[str, Any]:
+def parse_streaming(
+    text: str,
+    on_preview: Callable[[str], None],
+    llm_cfg: Optional[LLMRuntimeConfig] = None,
+) -> Dict[str, Any]:
     """
-    Envoie la requête en streaming à DeepInfra, construit une preview live réparée :
+    Envoie la requête en streaming au provider LLM actif, construit une preview live réparée :
     - si _attempt_repair_json(buffer) retourne un objet → on affiche ce JSON pretty
     - sinon on affiche last_valid_pretty + fragment heuristique
     """
-    if not DEEPINFRA_API_KEY:
-        raise RuntimeError("DEEPINFRA_API_KEY manquant.")
+    llm_cfg = llm_cfg or _resolve_llm_config()
 
-    payload = build_payload(text)
+    if not llm_cfg.api_key:
+        raise RuntimeError(f"API key manquante pour provider '{llm_cfg.provider}'.")
+
+    payload = build_payload(text, llm_cfg)
     acc_parts: List[str] = []
     acc_text = ""
     last_valid_pretty: Optional[str] = None
@@ -505,23 +789,36 @@ def parse_streaming(text: str, on_preview: Callable[[str], None]) -> Dict[str, A
             "yes" if last_valid_pretty else "no",
         )
 
-    full_txt = call_deepinfra_stream(payload, _on_chunk)
+    full_txt = call_llm_stream(payload, llm_cfg, _on_chunk)
     return _parse_with_repair(full_txt)
 
 
 # --------- Orchestrateur ---------
-def run_job(job_id: str, text: str, text_hash: str) -> None:
+def run_job(
+    job_id: str,
+    text: str,
+    text_hash: str,
+    llm_cfg: Optional[LLMRuntimeConfig] = None,
+) -> None:
+    llm_cfg = llm_cfg or _resolve_llm_config()
     set_job_status(job_id, status="running")
     t0 = time.time()
     job_dir = BASE_TMP / job_id
 
-    logger.info("Job %s démarré | tmp=%s | hash=%s", job_id, job_dir, text_hash[:8])
+    logger.info(
+        "Job %s démarré | provider=%s | model=%s | tmp=%s | hash=%s",
+        job_id,
+        llm_cfg.provider,
+        llm_cfg.model,
+        job_dir,
+        text_hash[:8],
+    )
 
     try:
         def _push_preview(pre: str):
             set_job_status(job_id, json_preview=pre)
 
-        doc = parse_streaming(text, on_preview=_push_preview)
+        doc = parse_streaming(text, on_preview=_push_preview, llm_cfg=llm_cfg)
 
         job_dir.mkdir(parents=True, exist_ok=True)
         outs = export_outputs(doc, job_dir, write_xlsx=True, use_enrich=True)
@@ -545,7 +842,12 @@ def run_job(job_id: str, text: str, text_hash: str) -> None:
             job_id,
             status="done",
             done_at=time.time(),
-            meta={**prev_meta, "elapsed_s": round(time.time() - t0, 3)},
+            meta={
+                **prev_meta,
+                "provider": llm_cfg.provider,
+                "model": llm_cfg.model,
+                "elapsed_s": round(time.time() - t0, 3),
+            },
         )
         logger.info("Job %s terminé en %.3fs", job_id, time.time() - t0)
 
@@ -560,7 +862,7 @@ def run_job(job_id: str, text: str, text_hash: str) -> None:
 
 
 # --------- FastAPI app ---------
-app = FastAPI(title="RFP_MASTER API", version="1.5.2")
+app = FastAPI(title="RFP_MASTER API", version="1.6.0-provider-aware")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -573,32 +875,76 @@ app.add_middleware(GZipMiddleware, minimum_size=512)
 
 @app.get("/health")
 def health():
+    active_cfg = _resolve_llm_config()
+    cfg_snapshot = _cfg_snapshot()
+
     return {
         "ok": True,
         "ts": time.time(),
-        "model": MODEL_NAME,
-        "max_tokens": RFP_MAX_TOKENS,
-        "temperature": RFP_TEMPERATURE,
-        "base_or_url_raw": DEEPINFRA_BASE_OR_URL,
-        "resolved_chat_url": DEEPINFRA_URL,
+        "api_version": "1.6.0-provider-aware",
+        "provider": active_cfg.provider,
+        "model": active_cfg.model,
+        "max_tokens": active_cfg.max_tokens,
+        "temperature": active_cfg.temperature,
+        "base_or_url_raw": active_cfg.base_or_url,
+        "resolved_chat_url": active_cfg.chat_url,
+        "api_key_state": _mask_secret(active_cfg.api_key),
         "tmp_dir": str(BASE_TMP),
+        "cfg_snapshot": {
+            "provider": cfg_snapshot.get("provider"),
+            "model": cfg_snapshot.get("model"),
+            "base_url": cfg_snapshot.get("base_url"),
+            "api_key_state": _mask_secret(str(cfg_snapshot.get("api_key") or "")),
+        },
+        "env_provider_sources": {
+            "RFP_PROVIDER": os.environ.get("RFP_PROVIDER"),
+            "LLM_PROVIDER": os.environ.get("LLM_PROVIDER"),
+        },
         "env_model_sources": {
             "RFP_MODEL": os.environ.get("RFP_MODEL"),
             "LLM_MODEL": os.environ.get("LLM_MODEL"),
             "DEEPINFRA_MODEL": os.environ.get("DEEPINFRA_MODEL"),
+            "FIREWORKS_MODEL": os.environ.get("FIREWORKS_MODEL"),
             "OPENAI_MODEL": os.environ.get("OPENAI_MODEL"),
             "MODEL": os.environ.get("MODEL"),
+        },
+        "env_url_sources": {
+            "DEEPINFRA_URL": os.environ.get("DEEPINFRA_URL"),
+            "DEEPINFRA_BASE_URL": os.environ.get("DEEPINFRA_BASE_URL"),
+            "FIREWORKS_URL": os.environ.get("FIREWORKS_URL"),
+            "FIREWORKS_BASE_URL": os.environ.get("FIREWORKS_BASE_URL"),
+            "LLM_BASE_URL": os.environ.get("LLM_BASE_URL"),
+            "OPENAI_BASE_URL": os.environ.get("OPENAI_BASE_URL"),
+        },
+        "env_key_states": {
+            "DEEPINFRA_API_KEY": _mask_secret(os.environ.get("DEEPINFRA_API_KEY", "")),
+            "FIREWORKS_API_KEY": _mask_secret(os.environ.get("FIREWORKS_API_KEY", "")),
+            "LLM_API_KEY": _mask_secret(os.environ.get("LLM_API_KEY", "")),
+            "OPENAI_API_KEY": _mask_secret(os.environ.get("OPENAI_API_KEY", "")),
         },
     }
 
 
 @app.post("/submit")
 def submit(payload: Dict[str, Any]):
-    text = (payload or {}).get("text", "")
+    payload = payload or {}
+    text = payload.get("text", "")
     if not isinstance(text, str) or not text.strip():
         raise HTTPException(400, "Champ 'text' manquant ou vide.")
 
-    text_hash = _hash_text(text)
+    provider_override = payload.get("provider")
+    model_override = payload.get("model")
+    max_tokens_override = payload.get("max_tokens")
+    temperature_override = payload.get("temperature")
+
+    llm_cfg = _resolve_llm_config(
+        provider_override=provider_override,
+        model_override=model_override,
+        max_tokens_override=max_tokens_override,
+        temperature_override=temperature_override,
+    )
+
+    text_hash = _hash_text(text, llm_cfg=llm_cfg)
 
     with JOBS_LOCK:
         existing = TEXT2JOB.get(text_hash)
@@ -610,21 +956,37 @@ def submit(payload: Dict[str, Any]):
                 "job_id": existing,
                 "status": existing_info.get("status", "unknown"),
                 "dedup": True,
+                "provider": llm_cfg.provider,
+                "model": llm_cfg.model,
             }
         )
 
-    job_id = new_job(text_hash, text)
-    logger.info("Submit job_id=%s len(text)=%d hash=%s", job_id, len(text), text_hash[:8])
+    job_id = new_job(text_hash, text, llm_cfg)
+    logger.info(
+        "Submit job_id=%s provider=%s model=%s len(text)=%d hash=%s",
+        job_id,
+        llm_cfg.provider,
+        llm_cfg.model,
+        len(text),
+        text_hash[:8],
+    )
 
     t = threading.Thread(
         target=run_job,
-        args=(job_id, text, text_hash),
+        args=(job_id, text, text_hash, llm_cfg),
         daemon=True,
         name=f"run_job_{job_id}",
     )
     t.start()
 
-    return JSONResponse({"job_id": job_id, "status": "queued"})
+    return JSONResponse(
+        {
+            "job_id": job_id,
+            "status": "queued",
+            "provider": llm_cfg.provider,
+            "model": llm_cfg.model,
+        }
+    )
 
 
 @app.get("/status")
