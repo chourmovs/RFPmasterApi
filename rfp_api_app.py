@@ -32,6 +32,9 @@ Ce que propose ce fichier
 - _cfg_snapshot :
   lit facultativement rfp_parser.cfg à titre informatif sans rendre le boot dépendant
   de ce module.
+- _configure_prompt_logger :
+  force proprement le niveau DEBUG du logger rfp_parser.prompting lorsque RFP_DEBUG=1,
+  même si Uvicorn/Coolify a déjà configuré le logging racine.
 - _hash_text :
   construit le hash de déduplication en tenant compte du provider, du modèle et des
   paramètres d'inférence.
@@ -342,6 +345,62 @@ logger.propagate = False
 logger.setLevel(logging.DEBUG if RFP_DEBUG else logging.INFO)
 
 
+def _configure_prompt_logger() -> None:
+    """
+    Configure explicitement le logger de rfp_parser.prompting.
+
+    Pourquoi cette fonction existe
+    ------------------------------
+    prompting.py utilise logging.basicConfig(), mais sous Uvicorn/Coolify le root logger
+    est généralement déjà configuré avant l'import de l'application. Dans ce cas,
+    basicConfig() peut ne rien changer et les DEBUG du prompt restent invisibles malgré
+    RFP_DEBUG=1.
+
+    Cette fonction :
+    - force le niveau DEBUG/INFO du logger rfp_parser.prompting ;
+    - ajoute un handler dédié uniquement quand RFP_DEBUG=1 ;
+    - évite les doublons avec propagate=False lorsque le handler dédié est actif ;
+    - ne modifie en rien le contenu du prompt ou l'inférence.
+    """
+    prompt_logger = logging.getLogger("rfp_parser.prompting")
+    prompt_logger.setLevel(logging.DEBUG if RFP_DEBUG else logging.INFO)
+
+    marker = "_rfp_prompt_debug_handler"
+    existing = None
+
+    for handler in prompt_logger.handlers:
+        if getattr(handler, marker, False):
+            existing = handler
+            break
+
+    if RFP_DEBUG:
+        if existing is None:
+            prompt_handler = logging.StreamHandler()
+            prompt_handler.setLevel(logging.DEBUG)
+            prompt_handler.setFormatter(
+                logging.Formatter("[PROMPT] %(levelname)s: %(message)s")
+            )
+            setattr(prompt_handler, marker, True)
+            prompt_logger.addHandler(prompt_handler)
+
+        prompt_logger.propagate = False
+    else:
+        if existing is not None:
+            prompt_logger.removeHandler(existing)
+
+        prompt_logger.propagate = True
+
+
+_configure_prompt_logger()
+
+logger.info(
+    "Logging config | RFP_DEBUG=%s | RFP_API_level=%s | prompting_level=%s",
+    RFP_DEBUG,
+    logging.getLevelName(logger.level),
+    logging.getLevelName(logging.getLogger("rfp_parser.prompting").level),
+)
+
+
 def _resolve_llm_config(
     provider_override: Optional[str] = None,
     model_override: Optional[str] = None,
@@ -580,7 +639,7 @@ def _resolve_llm_config(
 BOOT_LLM_CONFIG = _resolve_llm_config()
 
 logger.info(
-    "Boot config THREE_PROVIDER_ROUTING_HF_CONTEXT_DEBUG | provider=%s model=%s max_tokens=%s "
+    "Boot config THREE_PROVIDER_ROUTING_DEBUG_LOGGING | provider=%s model=%s max_tokens=%s "
     "temperature=%s base_or_url=%s resolved_chat_url=%s api_key=%s tmp=%s",
     BOOT_LLM_CONFIG.provider,
     BOOT_LLM_CONFIG.model,
@@ -1354,7 +1413,7 @@ def run_job(
 # --------- FastAPI app ---------
 app = FastAPI(
     title="RFP_MASTER API",
-    version="1.7.1-hf-context-debug",
+    version="1.7.2-debug-logging",
 )
 
 app.add_middleware(
@@ -1379,7 +1438,17 @@ def health():
     return {
         "ok": True,
         "ts": time.time(),
-        "api_version": "1.7.1-hf-context-debug",
+        "api_version": "1.7.2-debug-logging",
+        "debug_enabled": RFP_DEBUG,
+        "logging": {
+            "rfp_api_level": logging.getLevelName(logger.level),
+            "prompting_level": logging.getLevelName(
+                logging.getLogger("rfp_parser.prompting").level
+            ),
+            "prompting_handlers": len(
+                logging.getLogger("rfp_parser.prompting").handlers
+            ),
+        },
         "provider": active_cfg.provider,
         "model": active_cfg.model,
         "max_tokens": active_cfg.max_tokens,
