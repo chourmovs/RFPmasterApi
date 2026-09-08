@@ -35,6 +35,9 @@ Ce que propose ce fichier
 - _hash_text :
   construit le hash de déduplication en tenant compte du provider, du modèle et des
   paramètres d'inférence.
+- _message_content_chars / _prompt_size_stats :
+  calculent une télémétrie non sensible de taille du prompt (caractères et estimation
+  grossière des tokens) afin de diagnostiquer les erreurs de fenêtre de contexte.
 - new_job / set_job_status / _safe_job_snapshot :
   gèrent les jobs asynchrones stockés en mémoire.
 - build_payload :
@@ -90,6 +93,9 @@ Alias Hugging Face acceptés :
 Paramètres communs :
 - RFP_MODEL / LLM_MODEL / MODEL
 - RFP_MAX_TOKENS / LLM_MAX_TOKENS / MAX_NEW_TOKENS
+- HF_MAX_TOKENS / HUGGINGFACE_MAX_TOKENS (override Hugging Face uniquement)
+- FIREWORKS_MAX_TOKENS (override Fireworks uniquement)
+- DEEPINFRA_MAX_TOKENS (override DeepInfra uniquement)
 - RFP_TEMPERATURE / LLM_TEMPERATURE
 - RFP_TMP_DIR
 - RFP_DEBUG=1
@@ -511,15 +517,33 @@ def _resolve_llm_config(
 
         source = provider
 
-    max_tokens = RFP_MAX_TOKENS
+    if provider == "huggingface":
+        provider_default_max_tokens = _env_int(
+            "HF_MAX_TOKENS",
+            "HUGGINGFACE_MAX_TOKENS",
+            default=RFP_MAX_TOKENS,
+        )
+    elif provider == "fireworks":
+        provider_default_max_tokens = _env_int(
+            "FIREWORKS_MAX_TOKENS",
+            default=RFP_MAX_TOKENS,
+        )
+    else:
+        provider_default_max_tokens = _env_int(
+            "DEEPINFRA_MAX_TOKENS",
+            default=RFP_MAX_TOKENS,
+        )
+
+    max_tokens = provider_default_max_tokens
+
     if max_tokens_override is not None and str(max_tokens_override).strip() != "":
         try:
             max_tokens = int(max_tokens_override)
         except Exception:
             logger.warning(
-                "max_tokens override ignoré car invalide: %r | fallback=%s",
+                "max_tokens override ignoré car invalide: %r | fallback provider=%s",
                 max_tokens_override,
-                RFP_MAX_TOKENS,
+                provider_default_max_tokens,
             )
 
     temperature = RFP_TEMPERATURE
@@ -556,7 +580,7 @@ def _resolve_llm_config(
 BOOT_LLM_CONFIG = _resolve_llm_config()
 
 logger.info(
-    "Boot config THREE_PROVIDER_ROUTING | provider=%s model=%s max_tokens=%s "
+    "Boot config THREE_PROVIDER_ROUTING_HF_CONTEXT_DEBUG | provider=%s model=%s max_tokens=%s "
     "temperature=%s base_or_url=%s resolved_chat_url=%s api_key=%s tmp=%s",
     BOOT_LLM_CONFIG.provider,
     BOOT_LLM_CONFIG.model,
@@ -601,6 +625,64 @@ def _hash_text(
             sort_keys=True,
         ).encode("utf-8")
     ).hexdigest()
+
+
+
+def _message_content_chars(content: Any) -> int:
+    """
+    Retourne une taille en caractères pour le contenu d'un message sans logger son texte.
+    Les messages RFP actuels sont des strings ; le fallback JSON permet de rester compatible
+    avec d'éventuels contenus OpenAI multimodaux/listes à l'avenir.
+    """
+    if content is None:
+        return 0
+
+    if isinstance(content, str):
+        return len(content)
+
+    try:
+        return len(json.dumps(content, ensure_ascii=False, default=str))
+    except Exception:
+        return len(str(content))
+
+
+def _prompt_size_stats(
+    payload: Dict[str, Any],
+    source_text: str = "",
+) -> Dict[str, Any]:
+    """
+    Produit une télémétrie de taille du prompt sans dépendance tokenizer.
+
+    approx_input_tokens utilise chars/4 uniquement comme ordre de grandeur de debug.
+    Ce n'est PAS un comptage tokenizer exact et cette valeur ne doit pas servir à tronquer
+    automatiquement le prompt métier.
+    """
+    messages = payload.get("messages") or []
+    message_chars: List[int] = []
+
+    for msg in messages:
+        if isinstance(msg, dict):
+            message_chars.append(_message_content_chars(msg.get("content")))
+        else:
+            message_chars.append(_message_content_chars(msg))
+
+    total_chars = sum(message_chars)
+    approx_input_tokens = (total_chars + 3) // 4 if total_chars else 0
+
+    try:
+        max_tokens = int(payload.get("max_tokens") or 0)
+    except Exception:
+        max_tokens = 0
+
+    return {
+        "source_chars": len(source_text or ""),
+        "message_count": len(messages),
+        "message_chars": message_chars,
+        "total_chars": total_chars,
+        "approx_input_tokens": approx_input_tokens,
+        "max_tokens": max_tokens,
+        "approx_total_budget_tokens": approx_input_tokens + max_tokens,
+    }
 
 
 def _safe_job_snapshot(job_id: str) -> Dict[str, Any]:
@@ -685,6 +767,22 @@ def build_payload(
     base["stream"] = True
     base["response_format"] = {"type": "json_object"}
 
+    prompt_stats = _prompt_size_stats(base, source_text=text)
+    logger.info(
+        "PROMPT size | provider=%s model=%s source_chars=%s messages=%s "
+        "message_chars=%s total_chars=%s approx_input_tokens=%s max_tokens=%s "
+        "approx_total_budget_tokens=%s",
+        llm_cfg.provider,
+        llm_cfg.model,
+        prompt_stats["source_chars"],
+        prompt_stats["message_count"],
+        prompt_stats["message_chars"],
+        prompt_stats["total_chars"],
+        prompt_stats["approx_input_tokens"],
+        prompt_stats["max_tokens"],
+        prompt_stats["approx_total_budget_tokens"],
+    )
+
     return base
 
 
@@ -736,6 +834,21 @@ def _iter_llm_stream(
                 body = r.text
             except Exception:
                 body = "<unreadable response body>"
+
+            if (
+                llm_cfg.provider == "huggingface"
+                and "context length" in body.lower()
+            ):
+                prompt_stats = _prompt_size_stats(payload)
+                raise RuntimeError(
+                    f"{llm_cfg.provider} HTTP {r.status_code}: {body} | "
+                    f"prompt_chars={prompt_stats['total_chars']} "
+                    f"approx_input_tokens={prompt_stats['approx_input_tokens']} "
+                    f"max_tokens={prompt_stats['max_tokens']} "
+                    f"approx_total_budget_tokens={prompt_stats['approx_total_budget_tokens']} | "
+                    "Diagnostic: tester HF_MAX_TOKENS=4096 puis, si l'erreur persiste, "
+                    "tester le même modèle avec un autre provider HF (:together ou :cerebras)."
+                )
 
             raise RuntimeError(
                 f"{llm_cfg.provider} HTTP {r.status_code}: {body}"
@@ -1241,7 +1354,7 @@ def run_job(
 # --------- FastAPI app ---------
 app = FastAPI(
     title="RFP_MASTER API",
-    version="1.7.0-three-providers",
+    version="1.7.1-hf-context-debug",
 )
 
 app.add_middleware(
@@ -1266,7 +1379,7 @@ def health():
     return {
         "ok": True,
         "ts": time.time(),
-        "api_version": "1.7.0-three-providers",
+        "api_version": "1.7.1-hf-context-debug",
         "provider": active_cfg.provider,
         "model": active_cfg.model,
         "max_tokens": active_cfg.max_tokens,
@@ -1286,6 +1399,15 @@ def health():
         "env_provider_sources": {
             "RFP_PROVIDER": os.environ.get("RFP_PROVIDER"),
             "LLM_PROVIDER": os.environ.get("LLM_PROVIDER"),
+        },
+        "env_max_token_sources": {
+            "RFP_MAX_TOKENS": os.environ.get("RFP_MAX_TOKENS"),
+            "LLM_MAX_TOKENS": os.environ.get("LLM_MAX_TOKENS"),
+            "MAX_NEW_TOKENS": os.environ.get("MAX_NEW_TOKENS"),
+            "HF_MAX_TOKENS": os.environ.get("HF_MAX_TOKENS"),
+            "HUGGINGFACE_MAX_TOKENS": os.environ.get("HUGGINGFACE_MAX_TOKENS"),
+            "FIREWORKS_MAX_TOKENS": os.environ.get("FIREWORKS_MAX_TOKENS"),
+            "DEEPINFRA_MAX_TOKENS": os.environ.get("DEEPINFRA_MAX_TOKENS"),
         },
         "env_model_sources": {
             "RFP_MODEL": os.environ.get("RFP_MODEL"),
