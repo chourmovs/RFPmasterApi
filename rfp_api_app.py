@@ -118,6 +118,7 @@ import hashlib
 from pathlib import Path
 import logging
 
+import pandas as pd
 import requests
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import JSONResponse, FileResponse
@@ -343,6 +344,184 @@ if not logger.handlers:
 
 logger.propagate = False
 logger.setLevel(logging.DEBUG if RFP_DEBUG else logging.INFO)
+
+
+# --------- Attachment Operations.xlsx ---------
+_OPERATIONS_DEFAULT_PATH = "/opt/workspace/RFPmaster/Operations.xlsx"
+_OPERATIONS_CACHE_LOCK = threading.Lock()
+_OPERATIONS_CACHE: Dict[Tuple[str, int], Dict[str, Any]] = {}
+
+
+def _operations_attachment_config() -> Dict[str, Any]:
+    """Lit la configuration de l'attachment sans figer les ENV au boot."""
+    return {
+        "enabled": _env_bool(
+            "RFP_OPERATIONS_ATTACHMENT_ENABLE",
+            default=True,
+        ),
+        "path": _env_first(
+            "RFP_OPERATIONS_PATH",
+            "DURATION_ATTACHMENT_PATH",
+            default=_OPERATIONS_DEFAULT_PATH,
+        ),
+        "max_sheets": max(
+            0,
+            _env_int("RFP_OPERATIONS_MAX_SHEETS", default=6),
+        ),
+        "max_rows": max(
+            0,
+            _env_int("RFP_OPERATIONS_MAX_ROWS", default=300),
+        ),
+        "max_chars": max(
+            0,
+            _env_int("RFP_OPERATIONS_MAX_CHARS", default=120000),
+        ),
+    }
+
+
+def _limit_operations_text(body: str, max_chars: int) -> str:
+    """Encadre le TSV et applique une limite dure sans perdre le marqueur final."""
+    start = "=== OPERATIONS STANDARDS ===\n\n"
+    end = "\n=== END OPERATIONS STANDARDS ==="
+    full = f"{start}{body.rstrip()}{end}"
+    if len(full) <= max_chars:
+        return full
+
+    truncation = "\n... [OPERATIONS STANDARDS TRUNCATED]"
+    available = max_chars - len(start) - len(truncation) - len(end)
+    if available >= 0:
+        return f"{start}{body[:available].rstrip()}{truncation}{end}"
+
+    # Une limite anormalement petite reste une limite dure et ne bloque pas l'inférence.
+    return full[:max_chars]
+
+
+def _build_operations_attachment(
+    path: Path,
+    max_sheets: int,
+    max_rows: int,
+    max_chars: int,
+) -> Dict[str, Any]:
+    """Convertit les premières feuilles utiles du workbook en TSV compact."""
+    parts: List[str] = []
+    sheet_count = 0
+    row_count = 0
+
+    with pd.ExcelFile(path) as workbook:
+        for sheet_name in workbook.sheet_names:
+            if sheet_count >= max_sheets or row_count >= max_rows:
+                break
+
+            remaining_rows = max_rows - row_count
+            frame = pd.read_excel(
+                workbook,
+                sheet_name=sheet_name,
+                nrows=remaining_rows,
+            )
+            if frame.empty and len(frame.columns) == 0:
+                continue
+
+            parts.append(
+                f"## {sheet_name}\n"
+                + frame.to_csv(
+                    sep="\t",
+                    index=False,
+                    lineterminator="\n",
+                    na_rep="",
+                ).rstrip()
+            )
+            sheet_count += 1
+            row_count += len(frame.index)
+
+    attachment = _limit_operations_text("\n\n".join(parts), max_chars)
+    return {
+        "text": attachment,
+        "sheets": sheet_count,
+        "rows": row_count,
+        "chars": len(attachment),
+    }
+
+
+def _get_operations_attachment() -> Optional[str]:
+    """Retourne l'attachment Operations.xlsx, mis en cache par chemin + mtime."""
+    config = _operations_attachment_config()
+    path = Path(config["path"]).expanduser()
+
+    logger.info("Operations attachment path: %s", path)
+    if not config["enabled"]:
+        return None
+
+    try:
+        stat = path.stat()
+        if not path.is_file():
+            raise FileNotFoundError(path)
+    except (OSError, ValueError):
+        logger.warning("Operations attachment unavailable | path=%s", path)
+        return None
+
+    logger.info(
+        "Operations workbook found | path=%s | size=%s bytes",
+        path,
+        stat.st_size,
+    )
+    cache_key = (str(path), stat.st_mtime_ns)
+
+    with _OPERATIONS_CACHE_LOCK:
+        cached = _OPERATIONS_CACHE.get(cache_key)
+        if cached is not None:
+            logger.info("Operations attachment cache HIT | path=%s", path)
+            return str(cached["text"])
+
+        try:
+            built = _build_operations_attachment(
+                path,
+                max_sheets=config["max_sheets"],
+                max_rows=config["max_rows"],
+                max_chars=config["max_chars"],
+            )
+        except Exception as exc:
+            logger.warning(
+                "Operations attachment unavailable | path=%s | error=%s",
+                path,
+                type(exc).__name__,
+            )
+            return None
+
+        # Une seule version par chemin suffit ; les anciennes mtimes sont évacuées.
+        for old_key in list(_OPERATIONS_CACHE):
+            if old_key[0] == str(path) and old_key != cache_key:
+                del _OPERATIONS_CACHE[old_key]
+        _OPERATIONS_CACHE[cache_key] = built
+
+    logger.info(
+        "Operations attachment built | sheets=%s | rows=%s | chars=%s",
+        built["sheets"],
+        built["rows"],
+        built["chars"],
+    )
+    return str(built["text"])
+
+
+def _operations_attachment_health() -> Dict[str, Any]:
+    config = _operations_attachment_config()
+    path = Path(config["path"]).expanduser()
+    exists = path.is_file()
+    cached = False
+
+    if exists:
+        try:
+            cache_key = (str(path), path.stat().st_mtime_ns)
+            with _OPERATIONS_CACHE_LOCK:
+                cached = cache_key in _OPERATIONS_CACHE
+        except OSError:
+            exists = False
+
+    return {
+        "enabled": config["enabled"],
+        "path": str(path),
+        "exists": exists,
+        "cached": cached,
+    }
 
 
 def _configure_prompt_logger() -> None:
@@ -815,9 +994,19 @@ def build_payload(
     Construit le payload Chat Completions.
     build_chat_payload reste responsable du prompt métier sensible.
     """
+    operations_attachment = _get_operations_attachment()
+    attachments = [operations_attachment] if operations_attachment else None
+    logger.info(
+        "Prompt operations attachment | enabled=%s | attached=%s | chars=%s",
+        _operations_attachment_config()["enabled"],
+        bool(attachments),
+        len(operations_attachment or ""),
+    )
+
     base = build_chat_payload(
         text,
         model=llm_cfg.model,
+        attachments=attachments,
     )
 
     base["model"] = llm_cfg.model
@@ -1440,6 +1629,7 @@ def health():
         "ts": time.time(),
         "api_version": "1.7.2-debug-logging",
         "debug_enabled": RFP_DEBUG,
+        "operations_attachment": _operations_attachment_health(),
         "logging": {
             "rfp_api_level": logging.getLevelName(logger.level),
             "prompting_level": logging.getLevelName(
